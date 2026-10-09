@@ -46,6 +46,27 @@ def probe(path: Path) -> AudioInfo:
     return AudioInfo(duration_seconds=duration, has_audio=has_audio)
 
 
+def measure_duration(path: Path) -> float | None:
+    """Length of the first audio track, found by decoding it.
+
+    Slower than probe() (well under a second per minute of audio), so it is only used when
+    the container doesn't state its length, as with streamed WebM from Android's recorder.
+    """
+    result = _run(
+        ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-progress", "pipe:1", "-nostats",
+         "-i", str(path), "-vn", "-map", "0:a:0", "-f", "null", "-"],
+        timeout=600,
+    )
+    if result.returncode != 0:
+        return None
+    seconds = None
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key == "out_time_us" and value.strip().isdigit():
+            seconds = int(value) / 1_000_000
+    return seconds or None
+
+
 def _ffmpeg(args: list[str], timeout: float) -> None:
     result = _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *args], timeout)
     if result.returncode != 0:

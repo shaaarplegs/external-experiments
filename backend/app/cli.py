@@ -42,6 +42,7 @@ def make_admin(db: Session, email: str, password: str | None = None, full_name: 
         db.add(user)
     user.role = UserRole.ADMIN
     user.is_active = True
+    user.disabled_reason, user.disabled_at = None, None
     db.commit()
     return created
 

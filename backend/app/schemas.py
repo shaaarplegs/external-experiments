@@ -368,8 +368,8 @@ class DailyPoint(BaseModel):
 
 
 class TopUser(BaseModel):
-    user_id: uuid.UUID | None = Field(description="null if the account was deleted")
-    email: str | None
+    user_id: uuid.UUID
+    email: str
     uploads: int
     audio_minutes: float
 
@@ -392,7 +392,7 @@ class DashboardMeetings(BaseModel):
 
 class DashboardUsage(BaseModel):
     uploads: int
-    audio_minutes: float = Field(description="Audio actually transcribed")
+    audio_minutes: float = Field(description="Audio sent to the speech-to-text API (what it bills)")
     average_recording_minutes: float | None
     summaries_regenerated: int
     jobs: int

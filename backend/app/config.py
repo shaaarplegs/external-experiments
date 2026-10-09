@@ -2,7 +2,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BeforeValidator, EmailStr, Field
+from pydantic import BeforeValidator, EmailStr, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parent
@@ -39,9 +39,9 @@ class Settings(BaseSettings):
     # Seeded admin: created at startup if no account with this email exists yet. The
     # password is only used for that first creation; change it in the app afterwards.
     admin_email: Annotated[EmailStr | None, BeforeValidator(_empty_as_none)] = None
-    admin_password: Annotated[str | None, BeforeValidator(_empty_as_none)] = Field(
-        default=None, min_length=8, repr=False
-    )
+    # SecretStr: never shown in logs or validation errors. Its length is checked when the
+    # account is created (a short one is logged as an error; it doesn't stop the app).
+    admin_password: Annotated[SecretStr | None, BeforeValidator(_empty_as_none)] = None
 
     # Hard cap on any request body. Cloud Run rejects HTTP/1 bodies over 32 MiB anyway;
     # the (lower) per-upload limit is an admin setting.

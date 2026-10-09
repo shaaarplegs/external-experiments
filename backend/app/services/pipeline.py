@@ -3,11 +3,12 @@
 import logging
 import shutil
 import uuid
+from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
 
 import openai
-from sqlalchemy import update
+from sqlalchemy import case, func, update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -48,6 +49,28 @@ def is_processing(meeting: Meeting) -> bool:
     return meeting.status in PROCESSING_STATUSES
 
 
+def _fail_running_runs(db: Session, *conditions) -> None:
+    """Close RUNNING runs as failed. If audio was already sent to the speech-to-text API the
+    run failed after transcription (and still counts toward quotas)."""
+    db.execute(
+        update(ProcessingRun)
+        .where(ProcessingRun.status == RunStatus.RUNNING, *conditions)
+        .values(
+            status=RunStatus.FAILED,
+            failed_stage=case(
+                (func.coalesce(ProcessingRun.transcribed_seconds, 0) > 0, "summary"), else_="transcription"
+            ),
+            finished_at=utcnow(),
+        )
+    )
+
+
+def close_runs_for_meeting(db: Session, meeting_id: uuid.UUID) -> None:
+    """Before a meeting is deleted: its usage log entries must not stay "running" forever.
+    If the job is in fact still alive, it records the real outcome when it ends."""
+    _fail_running_runs(db, ProcessingRun.meeting_id == meeting_id)
+
+
 def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> None:
     """Jobs run in-process; if the instance died mid-job, report the meeting as failed."""
     cutoff = utcnow() - timedelta(minutes=settings.processing_timeout_minutes)
@@ -55,12 +78,7 @@ def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> No
     for meeting in meetings:
         started = meeting.processing_started_at
         if is_processing(meeting) and started and started < cutoff:
-            stage = "summary" if meeting.status == MeetingStatus.SUMMARIZING else "transcription"
-            db.execute(
-                update(ProcessingRun)
-                .where(ProcessingRun.meeting_id == meeting.id, ProcessingRun.status == RunStatus.RUNNING)
-                .values(status=RunStatus.FAILED, failed_stage=stage, finished_at=utcnow())
-            )
+            _fail_running_runs(db, ProcessingRun.meeting_id == meeting.id)
             meeting.status = MeetingStatus.FAILED
             meeting.error_message = INTERRUPTED_MESSAGE
             changed = True
@@ -68,16 +86,37 @@ def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> No
         db.commit()
 
 
+def sweep_stale(db: Session, settings: Settings) -> None:
+    """expire_stale for everything at once: run before counting usage (quotas, dashboard), so
+    jobs that died with their instance don't count as running forever."""
+    cutoff = utcnow() - timedelta(minutes=settings.processing_timeout_minutes)
+    _fail_running_runs(db, ProcessingRun.created_at < cutoff)
+    db.execute(
+        update(Meeting)
+        .where(Meeting.status.in_(PROCESSING_STATUSES), Meeting.processing_started_at < cutoff)
+        .values(status=MeetingStatus.FAILED, error_message=INTERRUPTED_MESSAGE)
+    )
+    db.commit()
+
+
 def transcribe_audio(
-    transcriber: Transcriber, source: Path, work_dir: Path, language: str | None, chunk_seconds: int
+    transcriber: Transcriber,
+    source: Path,
+    work_dir: Path,
+    language: str | None,
+    chunk_seconds: int,
+    on_chunk_done: Callable[[float], None] | None = None,
 ) -> tuple[str, float]:
-    """Returns the transcript and the recording's length in seconds."""
+    """Returns the transcript and the recording's length in seconds. on_chunk_done gets the
+    seconds of audio in each chunk the API has transcribed (i.e. billed)."""
     audio = normalize(source, work_dir / "chunks")
     texts = []
-    for index, chunk in enumerate(iter_chunks(audio, chunk_seconds), start=1):
-        logger.info("Transcribing chunk %s", index)
+    for index, chunk in enumerate(iter_chunks(audio, chunk_seconds)):
+        logger.info("Transcribing chunk %s", index + 1)
         text = transcriber.transcribe_file(chunk, language)
         chunk.unlink()
+        if on_chunk_done is not None:
+            on_chunk_done(min(chunk_seconds, audio.duration_seconds - index * chunk_seconds))
         if text:
             texts.append(text)
     return "\n".join(texts), audio.duration_seconds
@@ -177,12 +216,22 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, run_id: uuid.UUID, a
         if audio_path is not None:
             meeting.status = MeetingStatus.TRANSCRIBING
             db.commit()
+            run = db.get(ProcessingRun, run_id)
+
+            def record_progress(seconds: float) -> None:
+                # Committed per chunk, so audio the API billed is counted even if the
+                # instance dies before the job finishes.
+                if run is not None:
+                    run.transcribed_seconds = (run.transcribed_seconds or 0) + seconds
+                    db.commit()
+
             transcript, audio_seconds = transcribe_audio(
                 services.make_transcriber(runtime),
                 audio_path,
                 audio_path.parent,
                 meeting.language,
                 runtime.transcription_chunk_seconds,
+                record_progress,
             )
             if not transcript.strip():
                 raise NoSpeechError("No speech was detected in the recording.")

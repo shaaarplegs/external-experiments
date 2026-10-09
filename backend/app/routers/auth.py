@@ -27,6 +27,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 # A refresh token reused within this window is treated as a client retry, not theft.
 REUSE_GRACE = timedelta(seconds=60)
+# How long expired refresh tokens are kept (for reuse detection) before they are deleted.
+TOKEN_RETENTION = timedelta(days=60)
 # Verifying against a dummy hash keeps response times similar for unknown emails.
 _DUMMY_HASH = hash_password("dummy-password-for-timing")
 
@@ -34,8 +36,13 @@ _DUMMY_HASH = hash_password("dummy-password-for-timing")
 def issue_tokens(db: Session, user: User, settings: Settings) -> AuthResponse:
     now = utcnow()
     user.last_active_at = now
-    # Housekeeping: a user's expired refresh tokens are of no further use.
-    db.execute(delete(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.expires_at < now))
+    # Housekeeping: drop this user's tokens that expired long ago. Recently expired (and
+    # rotated) ones are kept a while so reusing a stolen old token is still detected.
+    db.execute(
+        delete(RefreshToken).where(
+            RefreshToken.user_id == user.id, RefreshToken.expires_at < now - TOKEN_RETENTION
+        )
+    )
     raw = new_refresh_token()
     db.add(
         RefreshToken(

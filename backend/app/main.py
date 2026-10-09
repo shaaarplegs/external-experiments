@@ -21,8 +21,9 @@ summary and action items. Meetings can be categorized, edited and exported as PD
 Authenticate with `POST /auth/login` (or `/auth/register`), then send
 `Authorization: Bearer <access_token>`. Refresh with `POST /auth/refresh` before it expires.
 
-Admins (users with role `admin`) manage provider API keys, models, the summary prompt and
-limits under `/admin/settings`, and registered accounts under `/admin/users`.
+Admins (users with role `admin`) have their own endpoints under `/admin`: global settings
+(provider API keys, models, the summary prompt, limits, quotas), the usage dashboard, accounts
+(revoke access, quotas), every user's meetings, and the audit log of admin actions.
 """
 
 
@@ -73,7 +74,10 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     async def lifespan(app: FastAPI):
         services = app.state.services
         await run_in_threadpool(
-            seed_admin_from_settings, services.session_factory, settings.admin_email, settings.admin_password
+            seed_admin_from_settings,
+            services.session_factory,
+            settings.admin_email,
+            settings.admin_password.get_secret_value() if settings.admin_password else None,
         )
         yield
 

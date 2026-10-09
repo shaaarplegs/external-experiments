@@ -5,6 +5,7 @@ from app.routers.admin import ensure_not_last_admin
 from app.routers.auth import revoke_all_refresh_tokens
 from app.schemas import PasswordChange, UsageOut, UserOut, UserUpdate
 from app.security import hash_password, verify_password
+from app.services.pipeline import sweep_stale
 from app.services.usage import monthly_usage
 
 router = APIRouter(prefix="/users", tags=["users"])
@@ -18,6 +19,7 @@ def get_me(user: CurrentUser):
 @router.get("/me/usage", response_model=UsageOut)
 def get_my_usage(user: CurrentUser, db: DbSession, services: AppServices):
     """Uploads and audio minutes used this month, and the limits (null = unlimited)."""
+    sweep_stale(db, services.settings)
     usage = monthly_usage(db, user, services.load_runtime_settings(db))
     return UsageOut(
         period_start=usage.period_start,
@@ -41,8 +43,9 @@ def update_me(body: UserUpdate, user: CurrentUser, db: DbSession):
 def change_password(body: PasswordChange, user: CurrentUser, db: DbSession):
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Current password is incorrect")
-    user.password_hash = hash_password(body.new_password)
+    # Tokens first, then the user row: the same lock order as /auth/refresh (no deadlock).
     revoke_all_refresh_tokens(db, user.id)  # sign out other devices
+    user.password_hash = hash_password(body.new_password)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 

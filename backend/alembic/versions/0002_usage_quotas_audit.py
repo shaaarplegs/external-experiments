@@ -43,6 +43,7 @@ def upgrade() -> None:
     sa.Column('status', sa.String(length=20), nullable=False),
     sa.Column('failed_stage', sa.String(length=20), nullable=True),
     sa.Column('audio_seconds', sa.Float(), nullable=True),
+    sa.Column('transcribed_seconds', sa.Float(), nullable=True),
     sa.Column('transcription_model', sa.String(length=200), nullable=True),
     sa.Column('llm_model', sa.String(length=200), nullable=True),
     sa.Column('llm_prompt_tokens', sa.Integer(), nullable=False),

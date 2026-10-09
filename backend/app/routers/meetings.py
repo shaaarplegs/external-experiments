@@ -21,6 +21,7 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.config import Settings
 from app.deps import AppServices, AppSettings, CurrentUser, DbSession
 from app.exports.pdf import render_pdf
 from app.exports.view import build_view, export_filename
@@ -48,8 +49,15 @@ from app.schemas import (
     MeetingUpdate,
     UTCDateTime,
 )
-from app.services.audio import AudioError, probe
-from app.services.pipeline import expire_stale, is_processing, mark_queued, run_pipeline
+from app.services.audio import AudioError, measure_duration, probe
+from app.services.pipeline import (
+    close_runs_for_meeting,
+    expire_stale,
+    is_processing,
+    mark_queued,
+    run_pipeline,
+    sweep_stale,
+)
 from app.services.usage import QuotaExceeded, check_quota, start_run
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
@@ -147,7 +155,14 @@ def save_upload(upload: UploadFile, work_dir: Path, runtime: RuntimeSettings) ->
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
         if not info.has_audio:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The file has no audio track")
-        if info.duration_seconds and info.duration_seconds > runtime.max_audio_minutes * 60:
+        if not info.duration_seconds:
+            # Limits and quotas need the length; measure it if the header doesn't say.
+            info.duration_seconds = measure_duration(path)
+        if not info.duration_seconds:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, "Could not determine the length of the recording"
+            )
+        if info.duration_seconds > runtime.max_audio_minutes * 60:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
                 f"Recordings longer than {runtime.max_audio_minutes} minutes are not supported",
@@ -167,8 +182,9 @@ def enforce_quota(db: Session, user: User, runtime: RuntimeSettings, audio_secon
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
 
 
-def precheck_quota(db: Session, user: User, runtime: RuntimeSettings) -> None:
-    """Cheap check before receiving the file: is any upload left this month?"""
+def precheck_quota(db: Session, user: User, runtime: RuntimeSettings, settings: Settings) -> None:
+    """Cheap check before receiving the file: is any upload (and any minute) left this month?"""
+    sweep_stale(db, settings)  # jobs that died with their instance must not count as running
     try:
         check_quota(db, user, runtime, None)
     except QuotaExceeded as exc:
@@ -211,7 +227,7 @@ def create_meeting(
     language_hint = resolve_language(language, runtime)
     if category_id is not None:
         get_owned_category(db, user, category_id)
-    precheck_quota(db, user, runtime)
+    precheck_quota(db, user, runtime, services.settings)
 
     audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
@@ -327,7 +343,9 @@ def update_meeting(meeting_id: uuid.UUID, body: MeetingUpdate, user: CurrentUser
 
 @router.delete("/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_meeting(meeting_id: uuid.UUID, user: CurrentUser, db: DbSession):
-    db.delete(get_owned_meeting(db, user, meeting_id))
+    meeting = get_owned_meeting(db, user, meeting_id)
+    close_runs_for_meeting(db, meeting.id)
+    db.delete(meeting)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
@@ -348,7 +366,7 @@ def replace_audio(
     ensure_idle(meeting)
     runtime = services.load_runtime_settings(db)
     language_hint = resolve_language(language, runtime) if language is not None else meeting.language
-    precheck_quota(db, user, runtime)
+    precheck_quota(db, user, runtime, services.settings)
     audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
         lock_idle_meeting(db, meeting)

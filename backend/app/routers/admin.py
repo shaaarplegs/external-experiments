@@ -41,7 +41,7 @@ from app.schemas import (
     UTCDateTime,
 )
 from app.services.dashboard import build_dashboard
-from app.services.pipeline import expire_stale
+from app.services.pipeline import close_runs_for_meeting, expire_stale, sweep_stale
 from app.services.usage import usage_by_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -106,6 +106,7 @@ def get_dashboard(
     """KPIs for the period: users, meetings, usage (uploads, minutes, tokens, failures,
     estimated cost), a daily series, and what the app is used for (categories, topics,
     languages), plus the heaviest users."""
+    sweep_stale(db, services.settings)  # jobs that died with their instance count as failed
     return build_dashboard(db, services.load_runtime_settings(db), days)
 
 
@@ -170,6 +171,7 @@ def _get_user(db: Session, user_id: uuid.UUID) -> User:
 def list_users(
     admin: CurrentAdmin,
     db: DbSession,
+    settings: AppSettings,
     q: Annotated[str | None, Query(max_length=200, description="Search email and name")] = None,
     role: Literal["user", "admin"] | None = None,
     is_active: bool | None = None,
@@ -185,6 +187,7 @@ def list_users(
     if is_active is not None:
         filters.append(User.is_active.is_(is_active))
 
+    sweep_stale(db, settings)  # so dead jobs don't inflate "uploads this month"
     total = db.scalar(select(func.count()).select_from(User).where(*filters))
     users = list(
         db.scalars(select(User).where(*filters).order_by(User.created_at.desc()).limit(limit).offset(offset))
@@ -193,7 +196,8 @@ def list_users(
 
 
 @router.get("/users/{user_id}", response_model=AdminUserOut)
-def get_user(user_id: uuid.UUID, admin: CurrentAdmin, db: DbSession):
+def get_user(user_id: uuid.UUID, admin: CurrentAdmin, db: DbSession, settings: AppSettings):
+    sweep_stale(db, settings)
     return _users_out(db, [_get_user(db, user_id)])[0]
 
 
@@ -205,6 +209,10 @@ def update_user(user_id: uuid.UUID, body: AdminUserUpdate, admin: CurrentAdmin, 
     fields = body.model_fields_set
     if ("role" in fields and body.role == UserRole.USER) or ("is_active" in fields and body.is_active is False):
         ensure_not_last_admin(db, user)
+    revoking = "is_active" in fields and body.is_active is False and user.is_active
+    if revoking:
+        # Tokens first, then the user row: the same lock order as /auth/refresh (no deadlock).
+        revoke_all_refresh_tokens(db, user.id)  # signed out everywhere, immediately
 
     details: dict[str, Any] = {}
     if "role" in fields and body.role is not None and body.role != user.role:
@@ -224,7 +232,6 @@ def update_user(user_id: uuid.UUID, body: AdminUserUpdate, admin: CurrentAdmin, 
             details["access"] = "restored"
         else:
             user.disabled_reason, user.disabled_at = body.disabled_reason or None, utcnow()
-            revoke_all_refresh_tokens(db, user.id)  # signed out everywhere, immediately
             details["access"] = "revoked"
             details["reason"] = user.disabled_reason
     elif "disabled_reason" in fields and not user.is_active:
@@ -291,9 +298,23 @@ def list_all_meetings(
         )
     )
     expire_stale(db, meetings, settings)
-    items = [
-        AdminMeetingListItem(**to_list_item(m).model_dump(), owner=_owner(m)) for m in meetings
-    ]
+    # The list shows titles and summary overviews (and can search transcripts), so it is audited.
+    filters_used = {
+        "user_id": str(user_id) if user_id else None,
+        "q": q or None,
+        "status": status_filter,
+        "date_from": date_from.isoformat() if date_from else None,
+        "date_to": date_to.isoformat() if date_to else None,
+    }
+    audit(
+        db, admin, "meeting.list", details={
+            "filters": {k: v for k, v in filters_used.items() if v is not None},
+            "offset": offset,
+            "returned": [str(m.id) for m in meetings],
+        },
+    )
+    db.commit()
+    items = [AdminMeetingListItem(**to_list_item(m).model_dump(), owner=_owner(m)) for m in meetings]
     return AdminMeetingPage(items=items, total=total, limit=limit, offset=offset)
 
 
@@ -328,6 +349,7 @@ def export_any_meeting(
 def delete_any_meeting(meeting_id: uuid.UUID, admin: CurrentAdmin, db: DbSession):
     meeting = _get_meeting(db, meeting_id)
     audit(db, admin, "meeting.delete", "meeting", meeting.id, {"owner": meeting.owner.email, "title": meeting.title})
+    close_runs_for_meeting(db, meeting.id)
     db.delete(meeting)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

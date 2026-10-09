@@ -34,11 +34,12 @@ def month_bounds(now: datetime) -> tuple[datetime, datetime]:
 
 
 def counts_toward_quota():
-    """Uploads count unless their transcription failed; running ones count too, so
-    several uploads sent at once can't slip past the limit together."""
+    """Uploads count unless they failed before any audio was transcribed. Running ones
+    count too, so several uploads sent at once can't slip past the limit together; jobs
+    that died are closed by pipeline.sweep_stale before usage is counted."""
     return ProcessingRun.kind.in_(QUOTA_KINDS) & or_(
         ProcessingRun.status != RunStatus.FAILED,
-        ProcessingRun.failed_stage.is_distinct_from("transcription"),
+        func.coalesce(ProcessingRun.transcribed_seconds, 0) > 0,
     )
 
 
@@ -86,11 +87,15 @@ def check_quota(db: Session, user: User, runtime: RuntimeSettings, audio_seconds
     if usage.uploads_limit is not None and usage.uploads >= usage.uploads_limit:
         raise QuotaExceeded(f"You have used all {usage.uploads_limit} uploads for this month. {resets}")
     if usage.audio_minutes_limit is not None:
-        minutes = (audio_seconds or 0) / 60
         left = max(usage.audio_minutes_limit - usage.audio_minutes, 0)
+        if left <= 0:
+            raise QuotaExceeded(
+                f"You have used all {usage.audio_minutes_limit} audio minutes for this month. {resets}"
+            )
+        minutes = (audio_seconds or 0) / 60
         if minutes > left:
             raise QuotaExceeded(
-                f"This recording is {minutes:.0f} minutes, but only {left:.0f} of your "
+                f"This recording is {minutes:.1f} minutes long, but only {left:.1f} of your "
                 f"{usage.audio_minutes_limit} monthly minutes are left. {resets}"
             )
 

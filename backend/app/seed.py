@@ -43,6 +43,9 @@ def seed_admin_from_settings(session_factory, email: str | None, password: str |
     try:
         with session_factory() as db:
             result = seed_admin(db, email, password)
+    except ValueError as exc:
+        logger.error("Could not create the seeded admin account %s: %s", email, exc)
+        return
     except Exception:
         logger.exception("Could not create the seeded admin account %s", email)
         return

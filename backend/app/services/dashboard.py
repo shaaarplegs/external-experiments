@@ -36,11 +36,9 @@ def _utc_day(column):
     return func.date(func.timezone("UTC", column))
 
 
-def _transcribed():
-    """Runs whose audio was actually transcribed (paid for), for minutes and costs."""
-    return ProcessingRun.kind.in_(QUOTA_KINDS) & or_(
-        ProcessingRun.status == RunStatus.COMPLETED, ProcessingRun.failed_stage == "summary"
-    )
+# Audio actually sent to the speech-to-text API (what it bills), including jobs that found no
+# speech or failed later; used for "minutes" and the transcription cost.
+_BILLED_SECONDS = func.coalesce(func.sum(ProcessingRun.transcribed_seconds), 0.0)
 
 
 def _users(db: Session, start: datetime) -> DashboardUsers:
@@ -78,8 +76,8 @@ def _usage(db: Session, start: datetime, runtime: RuntimeSettings) -> DashboardU
     row = db.execute(
         select(
             func.count().filter(ProcessingRun.kind.in_(QUOTA_KINDS)),
-            func.coalesce(func.sum(ProcessingRun.audio_seconds).filter(_transcribed()), 0.0),
-            func.avg(ProcessingRun.audio_seconds).filter(_transcribed()),
+            _BILLED_SECONDS,
+            func.avg(ProcessingRun.audio_seconds).filter(ProcessingRun.transcribed_seconds > 0),
             func.count().filter(ProcessingRun.kind == RunKind.RESUMMARIZE),
             func.count(),
             func.count().filter(ProcessingRun.status == RunStatus.FAILED),
@@ -129,7 +127,7 @@ def _daily(db: Session, start: datetime, first_day: date, last_day: date) -> lis
             select(
                 day,
                 func.count().filter(ProcessingRun.kind.in_(QUOTA_KINDS)),
-                func.coalesce(func.sum(ProcessingRun.audio_seconds).filter(_transcribed()), 0.0),
+                _BILLED_SECONDS,
                 func.count().filter(ProcessingRun.status == RunStatus.FAILED),
             )
             .where(ProcessingRun.created_at >= start)
@@ -202,7 +200,7 @@ def _languages(db: Session, start: datetime) -> list[CountItem]:
     language = func.lower(func.coalesce(func.nullif(Meeting.summary["language"].astext, ""), "unknown"))
     rows = db.execute(
         select(language, func.count())
-        .where(Meeting.created_at >= start, Meeting.summary.is_not(None))
+        .where(Meeting.created_at >= start, func.jsonb_typeof(Meeting.summary) == "object")
         .group_by(language)
         .order_by(func.count().desc(), language)
     ).all()
@@ -211,10 +209,10 @@ def _languages(db: Session, start: datetime) -> list[CountItem]:
 
 def _top_users(db: Session, start: datetime) -> list[TopUser]:
     uploads = func.count().filter(ProcessingRun.kind.in_(QUOTA_KINDS))
-    minutes = func.coalesce(func.sum(ProcessingRun.audio_seconds).filter(_transcribed()), 0.0) / 60
+    minutes = _BILLED_SECONDS / 60
     rows = db.execute(
         select(ProcessingRun.user_id, User.email, uploads, minutes)
-        .outerjoin(User, User.id == ProcessingRun.user_id)
+        .join(User, User.id == ProcessingRun.user_id)  # deleted accounts are left out
         .where(ProcessingRun.created_at >= start)
         .group_by(ProcessingRun.user_id, User.email)
         .having(uploads > 0)

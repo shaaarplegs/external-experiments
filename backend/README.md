@@ -88,14 +88,17 @@ Every account has a role: `user` (default) or `admin`. Admins have full control:
   their own). The last active admin can't be demoted, disabled or deleted.
 - **Quotas**: global monthly limits on uploads and audio minutes in the settings, overridable
   per user with `PATCH /admin/users/{id} {"quota_uploads_per_month": 50}` (`null` = use the
-  global limit). Months are calendar months in UTC. Uploads whose transcription failed don't
-  count, and deleting meetings doesn't give quota back.
+  global limit). Months are calendar months in UTC. An upload counts once the speech-to-text
+  service has transcribed (and billed) any of it, so an upload that failed before that is free,
+  and deleting meetings doesn't give quota back. Recordings whose file doesn't state its length
+  (streamed WebM, for example) are measured on upload, so limits apply to them too.
 - **All meetings** (`/admin/meetings`): list every user's meetings (filter by user, status,
   date, or search titles and transcripts), open any meeting including its transcript, export
   it, or delete it.
 - **Audit log** (`GET /admin/audit-log`): every admin action that reads private content
-  (viewing or exporting a meeting) or changes something (settings, accounts, deleted meetings),
-  with the admin's email and time. Settings entries list which fields changed, never values.
+  (listing, searching, viewing or exporting meetings) or changes something (settings,
+  accounts, deleted meetings), with the admin's email and time. Settings entries list which
+  fields changed, never values.
 
 Until the admin panel exists, Swagger UI at `/docs` works as one: log in with
 `POST /auth/login`, click **Authorize**, paste the `access_token`, then use the `admin` endpoints.
@@ -104,7 +107,9 @@ Until the admin panel exists, Swagger UI at `/docs` works as one: log in with
 that email exists, it is created as an admin. Later starts leave it alone, so change the
 password in the app (`POST /users/me/password`) after the first login. If that email already
 belongs to a regular account it is **not** promoted automatically (whoever registered it would
-otherwise become admin with their own password); promote such an account deliberately with
+otherwise become admin with their own password). If the seeded account is ever deleted (only
+possible while another admin exists), the next start creates it again with `ADMIN_PASSWORD`;
+remove `ADMIN_EMAIL` to stop that. Promote an existing account deliberately with
 `python -m app.cli create-admin you@example.com`, or in the Neon SQL Editor with
 `UPDATE users SET role = 'admin' WHERE email = 'you@example.com';`.
 
@@ -189,7 +194,11 @@ done
 ```
 
 Keep `meetings-secret-key` as it is: changing it signs everyone out and the provider API keys
-would have to be entered again. Also set a budget alert (Billing → Budgets & alerts), e.g. at $5.
+would have to be entered again.
+
+Already deployed with an earlier version of this README? Only the admin password secret is new:
+create `meetings-admin-password` and grant access to it as above, then deploy with the flags
+below (database migrations run on startup). Also set a budget alert (Billing → Budgets & alerts), e.g. at $5.
 
 ### 3. Deploy
 
@@ -256,6 +265,8 @@ Then in GitHub → Settings → Secrets and variables → Actions → **Variable
 
 ## Costs and limits
 
+- **Usage log**: one small row per processing job (`processing_runs`), kept after meetings
+  and accounts are deleted so quotas and the dashboard stay correct.
 - **Cloud Run**: billed only while an instance is up (plus up to ~15 idle minutes after the last
   request with `--no-cpu-throttling`); light use stays within the monthly free tier.
 - **Neon free plan**: enough to start; transcripts and summaries are text. Audio is never

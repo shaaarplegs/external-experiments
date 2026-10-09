@@ -168,7 +168,7 @@ class Meeting(TimestampMixin, Base):
     transcript: Mapped[str | None] = mapped_column(Text)
     # Structured LLM output (overview, what_happened, decisions, parties, ...).
     # Action items live in their own table so users can edit and tick them off.
-    summary: Mapped[dict | None] = mapped_column(JSONB)
+    summary: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
 
     owner: Mapped[User] = relationship(back_populates="meetings")
     category: Mapped[Category | None] = relationship()
@@ -201,7 +201,10 @@ class ProcessingRun(Base):
     kind: Mapped[str] = mapped_column(String(20))
     status: Mapped[str] = mapped_column(String(20), default=RunStatus.RUNNING)
     failed_stage: Mapped[str | None] = mapped_column(String(20))  # "transcription" or "summary"
-    audio_seconds: Mapped[float | None] = mapped_column(Float)
+    audio_seconds: Mapped[float | None] = mapped_column(Float)  # the recording's length
+    # Audio actually sent to the speech-to-text API (what it bills), kept even if the job
+    # fails later. Runs with none don't count toward quotas.
+    transcribed_seconds: Mapped[float | None] = mapped_column(Float)
     transcription_model: Mapped[str | None] = mapped_column(String(200))
     llm_model: Mapped[str | None] = mapped_column(String(200))
     llm_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -221,7 +224,7 @@ class AdminAuditLog(Base):
     action: Mapped[str] = mapped_column(String(50), index=True)
     target_type: Mapped[str | None] = mapped_column(String(20))
     target_id: Mapped[str | None] = mapped_column(String(64), index=True)
-    details: Mapped[dict | None] = mapped_column(JSONB)
+    details: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 

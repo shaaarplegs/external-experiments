@@ -5,6 +5,7 @@ from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from sqlalchemy import select, update
 
 from app.main import create_app
@@ -66,15 +67,18 @@ def test_failures_record_the_stage(client, auth, m4a_file, services, fakes):
     assert summary_failure.llm_prompt_tokens == 1200  # tokens spent before the failure still count
 
 
-def test_interrupted_jobs_are_closed_in_the_log(client, auth, m4a_file, services):
+@pytest.mark.parametrize(("billed", "stage"), [(None, "transcription"), (3.0, "summary")])
+def test_interrupted_jobs_are_closed_in_the_log(client, auth, m4a_file, services, billed, stage):
     upload(client, auth, m4a_file)
     with services.session_factory() as db:
         db.execute(update(Meeting).values(status=MeetingStatus.TRANSCRIBING, processing_started_at=utcnow() - timedelta(hours=2)))
-        db.execute(update(ProcessingRun).values(status="running", finished_at=None, failed_stage=None))
+        db.execute(
+            update(ProcessingRun).values(status="running", finished_at=None, failed_stage=None, transcribed_seconds=billed)
+        )
         db.commit()
     client.get("/meetings", headers=auth)
     (run,) = runs(services)
-    assert (run.status, run.failed_stage) == ("failed", "transcription")
+    assert (run.status, run.failed_stage) == ("failed", stage)
 
 
 # --------------------------------------------------------------------- quotas
@@ -136,7 +140,8 @@ def test_monthly_minutes_quota(client, auth, audio_dir, m4a_file, services):
     long_file = make_audio(audio_dir / "seventy-seconds.m4a", 70, ["-c:a", "aac", "-b:a", "16k"])
     blocked = upload(client, auth, long_file)
     assert blocked.status_code == 429
-    assert "only 1 of your 1 monthly minutes are left" in blocked.json()["detail"]
+    assert blocked.json()["detail"].startswith("This recording is 1.2 minutes long, but only 1.0 of your 1 monthly minutes")
+    assert list(services.settings.work_dir.iterdir()) == []  # rejected after saving: still cleaned up
     assert upload(client, auth, m4a_file).status_code == 202  # 3 seconds fits
 
 
@@ -299,13 +304,13 @@ def test_dashboard_without_prices_or_data(client, admin_auth):
 
 def test_seeded_admin_is_created_at_startup(services):
     services.settings.admin_email = "Owner@Example.com"
-    services.settings.admin_password = "seeded-pass-123"
+    services.settings.admin_password = SecretStr("seeded-pass-123")
     with TestClient(create_app(services=services)) as client:
         login = client.post("/auth/login", json={"email": "owner@example.com", "password": "seeded-pass-123"})
         assert login.status_code == 200
         assert login.json()["user"]["role"] == "admin"
     # A restart finds the account and leaves it alone (password changes in the app are kept).
-    services.settings.admin_password = "a-different-password"
+    services.settings.admin_password = SecretStr("a-different-password")
     with TestClient(create_app(services=services)) as client:
         assert client.post("/auth/login", json={"email": "owner@example.com", "password": "seeded-pass-123"}).status_code == 200
 
@@ -319,3 +324,170 @@ def test_seeding_never_promotes_an_existing_account(client, services):
             seed_admin(db, "new@example.com", "short")
         assert seed_admin(db, "new@example.com", "long-enough-1") == SeedResult.CREATED
         assert seed_admin(db, "new@example.com", "long-enough-1") == SeedResult.EXISTS
+
+
+# ------------------------------------------------- fixes from the code review
+
+
+def streamed_webm(path, seconds):
+    """WebM written as a stream, like Android's recorder: no length in the header."""
+    import subprocess
+
+    data = subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=duration={seconds}",
+         "-c:a", "libopus", "-f", "webm", "pipe:1"],
+        check=True, capture_output=True,
+    ).stdout
+    path.write_bytes(data)
+    return path
+
+
+def test_headerless_recordings_are_measured_for_limits_and_quotas(client, auth, audio_dir, services):
+    from app.services.audio import probe
+
+    webm = streamed_webm(audio_dir / "stream.webm", 90)
+    assert probe(webm).duration_seconds is None  # the header really has no length
+
+    set_runtime_settings(services, quota_audio_minutes_per_month=2)
+    first = upload(client, auth, webm)
+    assert first.status_code == 202
+    assert first.json()["duration_seconds"] == 90
+    blocked = upload(client, auth, webm)  # 1.5 of 2 minutes used; another 1.5 doesn't fit
+    assert blocked.status_code == 429
+    assert "only 0.5 of your 2 monthly minutes" in blocked.json()["detail"]
+
+    set_runtime_settings(services, quota_audio_minutes_per_month=1)  # now over the limit already
+    over = upload(client, auth, webm)
+    assert over.status_code == 429
+    assert over.json()["detail"].startswith("You have used all 1 audio minutes")
+
+    set_runtime_settings(services, quota_audio_minutes_per_month=100, max_audio_minutes=1)
+    too_long = upload(client, auth, webm)
+    assert too_long.status_code == 422 and "longer than 1 minutes" in too_long.json()["detail"]
+
+
+def test_reuploads_count_toward_the_quota(client, auth, m4a_file, services):
+    set_runtime_settings(services, quota_uploads_per_month=2)
+    meeting_id = upload(client, auth, m4a_file).json()["id"]
+    with m4a_file.open("rb") as f:
+        assert client.post(f"/meetings/{meeting_id}/audio", files={"audio": ("v.m4a", f)}, headers=auth).status_code == 202
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 2
+    assert upload(client, auth, m4a_file).status_code == 429
+
+
+def test_uploads_still_processing_count_toward_the_quota(client, auth, m4a_file, services, monkeypatch):
+    """Two uploads sent at once must not both get through: running jobs count."""
+    monkeypatch.setattr("app.routers.meetings.run_pipeline", lambda *args: None)  # jobs stay "running"
+    set_runtime_settings(services, quota_uploads_per_month=1)
+    assert upload(client, auth, m4a_file).status_code == 202
+    assert upload(client, auth, m4a_file).status_code == 429
+    (run,) = runs(services)
+    assert run.status == "running"
+
+
+def test_a_dead_job_does_not_block_the_quota(client, auth, m4a_file, services, monkeypatch):
+    monkeypatch.setattr("app.routers.meetings.run_pipeline", lambda *args: None)  # the instance "dies"
+    set_runtime_settings(services, quota_uploads_per_month=1)
+    meeting_id = upload(client, auth, m4a_file).json()["id"]
+
+    # Deleting the stuck meeting closes its run, so the upload doesn't stay counted.
+    assert client.delete(f"/meetings/{meeting_id}", headers=auth).status_code == 204
+    (run,) = runs(services)
+    assert (run.status, run.failed_stage, run.meeting_id) == ("failed", "transcription", None)
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 0
+
+    # A run that lost its meeting some other way is closed once it is older than the timeout.
+    upload(client, auth, m4a_file)
+    with services.session_factory() as db:
+        db.execute(update(ProcessingRun).where(ProcessingRun.status == "running").values(
+            meeting_id=None, created_at=utcnow() - timedelta(hours=2)))
+        db.commit()
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 0
+
+
+def test_billed_audio_counts_even_when_no_speech_was_found(client, auth, m4a_file, services, fakes):
+    set_runtime_settings(services, quota_uploads_per_month=1)
+    fakes.transcriber.text = ""
+    meeting = client.get(f"/meetings/{upload(client, auth, m4a_file).json()['id']}", headers=auth).json()
+    assert meeting["status"] == "failed"
+    (run,) = runs(services)
+    assert run.transcribed_seconds == pytest.approx(3, abs=0.2)  # the API transcribed (and billed) it
+    assert upload(client, auth, m4a_file).status_code == 429
+
+
+def test_dashboard_minutes_and_cost_follow_billed_audio(client, auth, admin_auth, audio_dir, services, fakes):
+    set_runtime_settings(services, price_transcription_per_hour_usd=3.6)
+    recording = make_audio(audio_dir / "thirty.m4a", 30, ["-c:a", "aac", "-b:a", "16k"])
+    upload(client, auth, recording)  # completed: 30 s
+    fakes.summarizer.error = SummarizerError("bad json")
+    upload(client, auth, recording)  # transcribed, summary failed: 30 s billed
+    fakes.summarizer.error = None
+    fakes.transcriber.error = TranscriptionError("down")
+    upload(client, auth, recording)  # nothing transcribed
+
+    usage = client.get("/admin/dashboard", headers=admin_auth).json()["usage"]
+    assert usage["audio_minutes"] == pytest.approx(1.0, abs=0.02)
+    assert usage["estimated_transcription_cost_usd"] == pytest.approx(60 / 3600 * 3.6, abs=0.001)
+    assert usage["average_recording_minutes"] == pytest.approx(0.5, abs=0.02)
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 2
+
+
+def test_dashboard_leaves_out_deleted_accounts_and_cleared_summaries(client, auth, admin_auth, m4a_file):
+    omar = bearer(register(client, email="omar@example.com"))
+    upload(client, omar, m4a_file)
+    assert client.delete("/users/me", headers=omar).status_code == 204
+    meeting_id = upload(client, auth, m4a_file).json()["id"]
+    upload(client, auth, m4a_file)
+    client.patch(f"/meetings/{meeting_id}", json={"summary": None}, headers=auth)
+
+    dash = client.get("/admin/dashboard", headers=admin_auth).json()
+    assert [u["email"] for u in dash["top_users"]] == ["sara@example.com"]
+    assert dash["usage"]["uploads"] == 3  # the deleted account's usage still counts in totals
+    assert dash["languages"] == [{"label": "ar", "count": 1}]
+
+
+def test_admin_meeting_list_is_audited(client, auth, admin_auth, m4a_file):
+    meeting_id = upload(client, auth, m4a_file).json()["id"]
+    client.get("/admin/meetings", params={"q": "الإطلاق"}, headers=admin_auth)
+    entry = client.get("/admin/audit-log", params={"action": "meeting.list"}, headers=admin_auth).json()["items"][0]
+    assert entry["details"]["filters"] == {"q": "الإطلاق"}
+    assert entry["details"]["returned"] == [meeting_id]
+
+
+def test_create_admin_command_clears_an_old_revocation(client, admin_auth, services):
+    from app.cli import make_admin
+
+    tokens = register(client, email="omar@example.com")
+    client.patch(f"/admin/users/{tokens['user']['id']}", json={"is_active": False, "disabled_reason": "x"}, headers=admin_auth)
+    with services.session_factory() as db:
+        make_admin(db, "omar@example.com")
+    omar = client.get(f"/admin/users/{tokens['user']['id']}", headers=admin_auth).json()
+    assert (omar["is_active"], omar["disabled_reason"], omar["disabled_at"], omar["role"]) == (True, None, None, "admin")
+
+
+def test_a_short_seed_password_is_logged_without_crashing(services, caplog):
+    services.settings.admin_email = "owner@example.com"
+    services.settings.admin_password = SecretStr("short")
+    with TestClient(create_app(services=services)) as client:
+        assert client.get("/healthz").status_code == 200
+    assert "ADMIN_PASSWORD must be at least 8 characters" in caplog.text
+    assert "short" not in caplog.text.replace("at least 8 characters", "")
+
+
+def test_reused_refresh_token_is_detected_after_it_expired(client, services):
+    from app.models import RefreshToken
+    from app.security import hash_refresh_token
+
+    tokens = register(client)
+    rotated = client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).json()
+    with services.session_factory() as db:
+        db.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == hash_refresh_token(tokens["refresh_token"]))
+            .values(revoked_at=utcnow() - timedelta(days=40), expires_at=utcnow() - timedelta(days=10))
+        )
+        db.commit()
+    client.post("/auth/login", json={"email": "sara@example.com", "password": "correct-horse-1"})  # cleanup runs
+    # The old (rotated, expired) token is still known, so its reuse ends every session.
+    assert client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).status_code == 401
+    assert client.post("/auth/refresh", json={"refresh_token": rotated["refresh_token"]}).status_code == 401
