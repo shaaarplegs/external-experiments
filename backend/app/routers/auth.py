@@ -63,7 +63,11 @@ def issue_tokens(db: Session, user: User, settings: Settings) -> AuthResponse:
 def revoke_all_refresh_tokens(db: Session, user_id) -> None:
     db.execute(
         update(RefreshToken)
-        .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+        .where(
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+            RefreshToken.expires_at > utcnow(),  # expired ones are useless; leave them unstamped
+        )
         .values(revoked_at=utcnow())
     )
 

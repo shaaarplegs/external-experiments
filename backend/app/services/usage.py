@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import ProcessingRun, RunKind, RunStatus, User, utcnow
@@ -43,6 +43,16 @@ def counts_toward_quota():
     )
 
 
+# Minutes a run uses: failed runs only what the API billed; others the larger of the
+# recording's length and what was billed (a header can understate the length).
+_COUNTED_SECONDS = case(
+    (ProcessingRun.status == RunStatus.FAILED, func.coalesce(ProcessingRun.transcribed_seconds, 0)),
+    else_=func.greatest(
+        func.coalesce(ProcessingRun.audio_seconds, 0), func.coalesce(ProcessingRun.transcribed_seconds, 0)
+    ),
+)
+
+
 def effective_limits(user: User, runtime: RuntimeSettings) -> tuple[int | None, int | None]:
     uploads = user.quota_uploads_per_month
     minutes = user.quota_audio_minutes_per_month
@@ -56,7 +66,7 @@ def usage_by_user(db: Session, user_ids: list[uuid.UUID], now: datetime | None =
     """{user_id: (uploads, audio_minutes)} for the current month."""
     start, end = month_bounds(now or utcnow())
     rows = db.execute(
-        select(ProcessingRun.user_id, func.count(), func.coalesce(func.sum(ProcessingRun.audio_seconds), 0.0))
+        select(ProcessingRun.user_id, func.count(), func.coalesce(func.sum(_COUNTED_SECONDS), 0.0))
         .where(
             ProcessingRun.user_id.in_(user_ids),
             ProcessingRun.created_at >= start,

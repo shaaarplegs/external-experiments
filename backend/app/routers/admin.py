@@ -41,7 +41,7 @@ from app.schemas import (
     UTCDateTime,
 )
 from app.services.dashboard import build_dashboard
-from app.services.pipeline import close_runs_for_meeting, expire_stale, sweep_stale
+from app.services.pipeline import expire_stale, sweep_stale
 from app.services.usage import usage_by_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -349,7 +349,6 @@ def export_any_meeting(
 def delete_any_meeting(meeting_id: uuid.UUID, admin: CurrentAdmin, db: DbSession):
     meeting = _get_meeting(db, meeting_id)
     audit(db, admin, "meeting.delete", "meeting", meeting.id, {"owner": meeting.owner.email, "title": meeting.title})
-    close_runs_for_meeting(db, meeting.id)
     db.delete(meeting)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

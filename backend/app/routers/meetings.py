@@ -51,7 +51,6 @@ from app.schemas import (
 )
 from app.services.audio import AudioError, measure_duration, probe
 from app.services.pipeline import (
-    close_runs_for_meeting,
     expire_stale,
     is_processing,
     mark_queued,
@@ -157,7 +156,10 @@ def save_upload(upload: UploadFile, work_dir: Path, runtime: RuntimeSettings) ->
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The file has no audio track")
         if not info.duration_seconds:
             # Limits and quotas need the length; measure it if the header doesn't say.
-            info.duration_seconds = measure_duration(path)
+            try:
+                info.duration_seconds = measure_duration(path)
+            except AudioError:  # e.g. decoding timed out
+                info.duration_seconds = None
         if not info.duration_seconds:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT, "Could not determine the length of the recording"
@@ -344,7 +346,6 @@ def update_meeting(meeting_id: uuid.UUID, body: MeetingUpdate, user: CurrentUser
 @router.delete("/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_meeting(meeting_id: uuid.UUID, user: CurrentUser, db: DbSession):
     meeting = get_owned_meeting(db, user, meeting_id)
-    close_runs_for_meeting(db, meeting.id)
     db.delete(meeting)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

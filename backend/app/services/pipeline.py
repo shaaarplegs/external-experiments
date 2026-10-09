@@ -22,6 +22,7 @@ from app.models import (
     ProcessingRun,
     RunKind,
     RunStatus,
+    User,
     utcnow,
 )
 from app.runtime_settings import RuntimeSettings
@@ -29,6 +30,7 @@ from app.schemas import LLMMeetingSummary, MeetingSummaryContent
 from app.services.audio import AudioError, iter_chunks, normalize
 from app.services.summarizer import MeetingContext, Summarizer, SummarizerError
 from app.services.transcription import Transcriber, TranscriptionError
+from app.services.usage import QuotaExceeded, monthly_usage
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +60,13 @@ def _fail_running_runs(db: Session, *conditions) -> None:
         .values(
             status=RunStatus.FAILED,
             failed_stage=case(
-                (func.coalesce(ProcessingRun.transcribed_seconds, 0) > 0, "summary"), else_="transcription"
+                (ProcessingRun.kind == RunKind.RESUMMARIZE, "summary"),
+                (func.coalesce(ProcessingRun.transcribed_seconds, 0) > 0, "summary"),
+                else_="transcription",
             ),
             finished_at=utcnow(),
         )
     )
-
-
-def close_runs_for_meeting(db: Session, meeting_id: uuid.UUID) -> None:
-    """Before a meeting is deleted: its usage log entries must not stay "running" forever.
-    If the job is in fact still alive, it records the real outcome when it ends."""
-    _fail_running_runs(db, ProcessingRun.meeting_id == meeting_id)
 
 
 def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> None:
@@ -106,10 +104,14 @@ def transcribe_audio(
     language: str | None,
     chunk_seconds: int,
     on_chunk_done: Callable[[float], None] | None = None,
+    check_length: Callable[[float], None] | None = None,
 ) -> tuple[str, float]:
-    """Returns the transcript and the recording's length in seconds. on_chunk_done gets the
-    seconds of audio in each chunk the API has transcribed (i.e. billed)."""
+    """Returns the transcript and the recording's length in seconds. check_length gets the
+    decoded length before anything is sent; on_chunk_done gets the seconds of audio in each
+    chunk the API has transcribed (i.e. billed)."""
     audio = normalize(source, work_dir / "chunks")
+    if check_length is not None:
+        check_length(audio.duration_seconds)
     texts = []
     for index, chunk in enumerate(iter_chunks(audio, chunk_seconds)):
         logger.info("Transcribing chunk %s", index + 1)
@@ -160,7 +162,7 @@ def apply_summary(meeting: Meeting, summary: LLMMeetingSummary) -> None:
 
 def describe_failure(exc: Exception, stage: str) -> str:
     provider = "The speech-to-text service" if stage == "transcription" else "The summary service"
-    if isinstance(exc, (AudioError, NoSpeechError, TranscriptionError, SummarizerError)):
+    if isinstance(exc, (AudioError, NoSpeechError, QuotaExceeded, TranscriptionError, SummarizerError)):
         return str(exc)
     if isinstance(exc, openai.AuthenticationError):
         return f"{provider} rejected the server's API key."
@@ -216,14 +218,30 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, run_id: uuid.UUID, a
         if audio_path is not None:
             meeting.status = MeetingStatus.TRANSCRIBING
             db.commit()
-            run = db.get(ProcessingRun, run_id)
+
+            def update_run(**values) -> None:
+                # Short separate transactions: no connection is held while audio is transcribed.
+                with services.session_factory() as run_db:
+                    run_db.execute(update(ProcessingRun).where(ProcessingRun.id == run_id).values(**values))
+                    run_db.commit()
 
             def record_progress(seconds: float) -> None:
-                # Committed per chunk, so audio the API billed is counted even if the
-                # instance dies before the job finishes.
-                if run is not None:
-                    run.transcribed_seconds = (run.transcribed_seconds or 0) + seconds
-                    db.commit()
+                # Per chunk, so audio the API billed is counted even if the instance dies.
+                update_run(transcribed_seconds=func.coalesce(ProcessingRun.transcribed_seconds, 0) + seconds)
+
+            def check_length(seconds: float) -> None:
+                # The upload was checked against the file header, which can understate the length.
+                if seconds > runtime.max_audio_minutes * 60:
+                    raise AudioError(f"Recordings longer than {runtime.max_audio_minutes} minutes are not supported")
+                update_run(audio_seconds=seconds)
+                with services.session_factory() as quota_db:
+                    owner = quota_db.get(User, meeting.owner_id)
+                    usage = monthly_usage(quota_db, owner, runtime)
+                if usage.audio_minutes_limit is not None and usage.audio_minutes > usage.audio_minutes_limit:
+                    raise QuotaExceeded(
+                        f"This recording is {seconds / 60:.1f} minutes long, which goes over your "
+                        f"{usage.audio_minutes_limit} monthly minutes."
+                    )
 
             transcript, audio_seconds = transcribe_audio(
                 services.make_transcriber(runtime),
@@ -232,6 +250,7 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, run_id: uuid.UUID, a
                 meeting.language,
                 runtime.transcription_chunk_seconds,
                 record_progress,
+                check_length,
             )
             if not transcript.strip():
                 raise NoSpeechError("No speech was detected in the recording.")

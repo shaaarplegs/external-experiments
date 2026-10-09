@@ -390,14 +390,13 @@ def test_a_dead_job_does_not_block_the_quota(client, auth, m4a_file, services, m
     set_runtime_settings(services, quota_uploads_per_month=1)
     meeting_id = upload(client, auth, m4a_file).json()["id"]
 
-    # Deleting the stuck meeting closes its run, so the upload doesn't stay counted.
+    # Deleting the meeting doesn't free the upload while its job may still be running...
     assert client.delete(f"/meetings/{meeting_id}", headers=auth).status_code == 204
     (run,) = runs(services)
-    assert (run.status, run.failed_stage, run.meeting_id) == ("failed", "transcription", None)
-    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 0
+    assert (run.status, run.meeting_id) == ("running", None)
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 1
 
-    # A run that lost its meeting some other way is closed once it is older than the timeout.
-    upload(client, auth, m4a_file)
+    # ...but once it is older than the timeout it is closed and stops counting.
     with services.session_factory() as db:
         db.execute(update(ProcessingRun).where(ProcessingRun.status == "running").values(
             meeting_id=None, created_at=utcnow() - timedelta(hours=2)))
@@ -491,3 +490,31 @@ def test_reused_refresh_token_is_detected_after_it_expired(client, services):
     # The old (rotated, expired) token is still known, so its reuse ends every session.
     assert client.post("/auth/refresh", json={"refresh_token": tokens["refresh_token"]}).status_code == 401
     assert client.post("/auth/refresh", json={"refresh_token": rotated["refresh_token"]}).status_code == 401
+
+
+def test_a_header_that_understates_the_length_is_caught_before_transcription(
+    client, auth, m4a_file, services, fakes, monkeypatch
+):
+    from app.services.audio import AudioInfo
+
+    monkeypatch.setattr("app.routers.meetings.probe", lambda path: AudioInfo(duration_seconds=1.0, has_audio=True))
+    set_runtime_settings(services, quota_audio_minutes_per_month=1)
+    long_file = make_audio(services.settings.work_dir.parent / "long.m4a", 70, ["-c:a", "aac", "-b:a", "16k"])
+    meeting = client.get(f"/meetings/{upload(client, auth, long_file).json()['id']}", headers=auth).json()
+    assert meeting["status"] == "failed"
+    assert "goes over your 1 monthly minutes" in meeting["error_message"]
+    assert fakes.transcriber.calls == []  # nothing was sent to the API
+    assert client.get("/users/me/usage", headers=auth).json()["uploads"] == 0
+
+
+def test_revoking_access_leaves_expired_tokens_alone(client, admin_auth, services):
+    from app.models import RefreshToken
+
+    tokens = register(client, email="omar@example.com")
+    with services.session_factory() as db:
+        db.execute(update(RefreshToken).values(expires_at=utcnow() - timedelta(days=1)))
+        db.commit()
+    client.patch(f"/admin/users/{tokens['user']['id']}", json={"is_active": False}, headers=admin_auth)
+    with services.session_factory() as db:
+        expired = db.scalars(select(RefreshToken).where(RefreshToken.expires_at < utcnow())).all()
+    assert expired and all(t.revoked_at is None for t in expired)
