@@ -161,6 +161,30 @@ then `alembic revision --autogenerate -m "..."` and review the result.
 Everything below can be run from [Cloud Shell](https://shell.cloud.google.com) (it has `gcloud`
 and `git`), so nothing needs installing locally.
 
+### Quick deploy (Cloud SQL, one command)
+
+[`deploy/cloud-shell-deploy.sh`](deploy/cloud-shell-deploy.sh) does all of the steps below with
+Cloud SQL (PostgreSQL 16, `db-f1-micro`, about $9–10/month) as the database instead of Neon. It:
+- enables the APIs;
+- creates the service account, database, user and secrets (random `SECRET_KEY` and admin password);
+- deploys and checks `/healthz`;
+- prints the URL and the admin login.
+
+In Cloud Shell, with your project selected:
+
+```bash
+gh auth login        # the repository is private; sign in to GitHub
+gh repo clone shaaarplegs/external-experiments -- -b claude/new-private-repo-zw08i3
+cd external-experiments
+bash backend/deploy/cloud-shell-deploy.sh   # optional: REGION=... ADMIN_EMAIL=... in front
+```
+
+Then open `<url>/panel/`, sign in as the printed admin, and paste the Groq and DeepSeek keys
+under Settings. Run the script again to redeploy after code changes; it keeps the existing
+database and secrets.
+
+The manual steps below use Neon instead:
+
 ### 1. Database
 
 Create a [Neon](https://neon.tech) project in a region close to Cloud Run (for `europe-west1`,
