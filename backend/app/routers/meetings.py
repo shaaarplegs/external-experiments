@@ -165,7 +165,7 @@ def save_upload(upload: UploadFile, work_dir: Path, runtime: RuntimeSettings) ->
         if info.duration_seconds > runtime.max_audio_minutes * 60:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
-                f"Recordings longer than {runtime.max_audio_minutes} minutes are not supported",
+                f"Recordings longer than {runtime.max_audio_minutes} minute{'' if runtime.max_audio_minutes == 1 else 's'} are not supported",
             )
         return path, info.duration_seconds
     except BaseException:

@@ -363,7 +363,7 @@ def test_headerless_recordings_are_measured_for_limits_and_quotas(client, auth, 
 
     set_runtime_settings(services, quota_audio_minutes_per_month=100, max_audio_minutes=1)
     too_long = upload(client, auth, webm)
-    assert too_long.status_code == 422 and "longer than 1 minutes" in too_long.json()["detail"]
+    assert too_long.status_code == 422 and "longer than 1 minute are" in too_long.json()["detail"]
 
 
 def test_reuploads_count_toward_the_quota(client, auth, m4a_file, services):
