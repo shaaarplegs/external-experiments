@@ -105,5 +105,12 @@ data class MeetingDetail(
     val isProcessing get() = status in setOf("queued", "transcribing", "summarizing")
 }
 
+@Serializable
+data class SecretStatus(val configured: Boolean, val hint: String? = null)
+
+/** The parts of GET /admin/settings the app shows. */
+@Serializable
+data class AdminSettings(val transcription_api_key: SecretStatus, val llm_api_key: SecretStatus)
+
 /** A download from GET /meetings/{id}/export. */
 class ExportedFile(val name: String, val mimeType: String, val bytes: ByteArray)

@@ -90,6 +90,13 @@
     <string name="usage_resets">Resets on %1$s</string>
     <string name="usage_this_month">This month</string>
     <string name="what_happened">What happened</string>
+    <string name="admin_api_keys">API keys (admin)</string>
+    <string name="transcription_key">Groq key (transcription)</string>
+    <string name="llm_key">DeepSeek key (summaries)</string>
+    <string name="key_set">Set (…%1$s). Type to replace.</string>
+    <string name="key_not_set">Not set</string>
+    <string name="keys_saved">Saved.</string>
+    <string name="save_keys">Save keys</string>
     <plurals name="meeting_count">
         <item quantity="one">%d meeting</item>
         <item quantity="other">%d meetings</item>

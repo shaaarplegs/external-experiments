@@ -167,6 +167,19 @@ class ApiClient(private val session: SessionStore) {
         session.clear()
     }
 
+    // ----------------------------------------------------------------- admin
+
+    suspend fun adminSettings(): AdminSettings = call(get("admin/settings"))
+
+    /** Blank values are left unchanged. */
+    suspend fun setApiKeys(transcriptionKey: String, llmKey: String): AdminSettings {
+        val body = buildJsonObject {
+            if (transcriptionKey.isNotBlank()) put("transcription_api_key", transcriptionKey.trim())
+            if (llmKey.isNotBlank()) put("llm_api_key", llmKey.trim())
+        }
+        return call(patch("admin/settings", body))
+    }
+
     // ------------------------------------------------------------ categories
 
     suspend fun categories(): List<Category> = call(get("categories"))

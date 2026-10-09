@@ -39,6 +39,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.meetings.app.MeetingsApp
 import com.meetings.app.R
+import com.meetings.app.data.AdminSettings
+import com.meetings.app.data.SecretStatus
 import com.meetings.app.data.Usage
 import kotlinx.coroutines.launch
 
@@ -86,6 +88,8 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                 }
             }
+
+            if (user?.role == "admin") AdminKeys()
 
             HorizontalDivider()
             Text(stringResource(R.string.change_password), style = MaterialTheme.typography.titleMedium)
@@ -148,4 +152,53 @@ private fun UsageRow(label: String, used: Double, limit: Int?, format: String) {
         Text(if (limit == null) "$label: ${format.format(used)}" else "$label: ${format.format(used)} / $limit")
         if (limit != null && limit > 0) LinearProgressIndicator(progress = { (used / limit).toFloat().coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
     }
+}
+
+/** Admins set the provider API keys here (also available in the web admin panel at /panel). */
+@Composable
+private fun AdminKeys() {
+    val context = LocalContext.current
+    val api = api()
+    val scope = rememberCoroutineScope()
+    var settings by remember { mutableStateOf<AdminSettings?>(null) }
+    var groq by remember { mutableStateOf("") }
+    var deepseek by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var saved by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        try {
+            settings = api.adminSettings()
+        } catch (e: Exception) {
+            error = context.errorMessage(e)
+        }
+    }
+
+    @Composable
+    fun status(s: SecretStatus?): String = when {
+        s == null -> ""
+        s.configured -> stringResource(R.string.key_set, s.hint ?: "")
+        else -> stringResource(R.string.key_not_set)
+    }
+
+    HorizontalDivider()
+    Text(stringResource(R.string.admin_api_keys), style = MaterialTheme.typography.titleMedium)
+    OutlinedTextField(groq, { groq = it; saved = false }, label = { Text(stringResource(R.string.transcription_key)) },
+        supportingText = { Text(status(settings?.transcription_api_key)) },
+        singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+    OutlinedTextField(deepseek, { deepseek = it; saved = false }, label = { Text(stringResource(R.string.llm_key)) },
+        supportingText = { Text(status(settings?.llm_api_key)) },
+        singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+    ErrorText(error)
+    if (saved) Text(stringResource(R.string.keys_saved), color = MaterialTheme.colorScheme.primary)
+    Button(enabled = groq.isNotBlank() || deepseek.isNotBlank(), onClick = {
+        scope.launch {
+            error = null
+            try {
+                settings = api.setApiKeys(groq, deepseek)
+                groq = ""; deepseek = ""; saved = true
+            } catch (e: Exception) {
+                error = context.errorMessage(e)
+            }
+        }
+    }) { Text(stringResource(R.string.save_keys)) }
 }

@@ -22,7 +22,7 @@ The UI follows the phone's language: Arabic (right-to-left) or English.
   - summarize again, or upload the audio again after a failure;
   - delete the meeting.
 - **Categories:** add, rename and delete.
-- **Settings:**
+- **Settings:** (admins also see the Groq and DeepSeek API key fields)
   - this month's uploads and audio minutes against your quota;
   - change password;
   - sign out;

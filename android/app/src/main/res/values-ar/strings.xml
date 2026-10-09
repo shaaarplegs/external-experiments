@@ -90,6 +90,13 @@
     <string name="usage_resets">يُعاد التعيين في %1$s</string>
     <string name="usage_this_month">هذا الشهر</string>
     <string name="what_happened">ما الذي حدث</string>
+    <string name="admin_api_keys">مفاتيح API (للمشرف)</string>
+    <string name="transcription_key">مفتاح Groq (التفريغ)</string>
+    <string name="llm_key">مفتاح DeepSeek (التلخيص)</string>
+    <string name="key_set">مُعيَّن (…%1$s). اكتب لاستبداله.</string>
+    <string name="key_not_set">غير مُعيَّن</string>
+    <string name="keys_saved">تم الحفظ.</string>
+    <string name="save_keys">حفظ المفاتيح</string>
     <plurals name="meeting_count">
         <item quantity="zero">لا اجتماعات</item>
         <item quantity="one">اجتماع واحد</item>
