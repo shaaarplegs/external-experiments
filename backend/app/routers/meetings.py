@@ -21,7 +21,6 @@ from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from app.config import Settings
 from app.deps import AppServices, AppSettings, CurrentUser, DbSession
 from app.exports.pdf import render_pdf
 from app.exports.view import build_view, export_filename
@@ -35,6 +34,7 @@ from app.models import (
     User,
 )
 from app.routers.categories import get_owned_category
+from app.runtime_settings import RuntimeSettings
 from app.schemas import (
     ActionItemCreate,
     ActionItemOut,
@@ -102,9 +102,9 @@ def parse_attendees(raw: str | None) -> list[AttendeeIn]:
         ) from exc
 
 
-def resolve_language(raw: str | None, settings: Settings) -> str | None:
+def resolve_language(raw: str | None, runtime: RuntimeSettings) -> str | None:
     if raw is None or not raw.strip():
-        return settings.transcription_language
+        return runtime.language_hint
     value = raw.strip().lower()
     if value == "auto":
         return None
@@ -123,9 +123,9 @@ def set_attendees(meeting: Meeting, attendees: list[AttendeeIn]) -> None:
     ]
 
 
-def save_upload(upload: UploadFile, settings: Settings) -> tuple[Path, float | None]:
+def save_upload(upload: UploadFile, work_dir: Path, runtime: RuntimeSettings) -> tuple[Path, float | None]:
     """Copy the upload to a private work dir and check that it really contains audio."""
-    job_dir = settings.work_dir / uuid.uuid4().hex
+    job_dir = work_dir / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(upload.filename or "").suffix.lower()
     path = job_dir / f"source{suffix if re.fullmatch(r'\.[a-z0-9]{1,5}', suffix) else ''}"
@@ -135,9 +135,9 @@ def save_upload(upload: UploadFile, settings: Settings) -> tuple[Path, float | N
         size = path.stat().st_size
         if size == 0:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The uploaded file is empty")
-        if size > settings.max_upload_mb * 1024 * 1024:  # chunked uploads skip the header check
+        if size > runtime.max_upload_mb * 1024 * 1024:
             raise HTTPException(
-                status.HTTP_413_CONTENT_TOO_LARGE, f"Upload is larger than {settings.max_upload_mb} MB"
+                status.HTTP_413_CONTENT_TOO_LARGE, f"Upload is larger than {runtime.max_upload_mb} MB"
             )
         try:
             info = probe(path)
@@ -145,10 +145,10 @@ def save_upload(upload: UploadFile, settings: Settings) -> tuple[Path, float | N
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from exc
         if not info.has_audio:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "The file has no audio track")
-        if info.duration_seconds and info.duration_seconds > settings.max_audio_minutes * 60:
+        if info.duration_seconds and info.duration_seconds > runtime.max_audio_minutes * 60:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_CONTENT,
-                f"Recordings longer than {settings.max_audio_minutes} minutes are not supported",
+                f"Recordings longer than {runtime.max_audio_minutes} minutes are not supported",
             )
         return path, info.duration_seconds
     except BaseException:
@@ -180,13 +180,13 @@ def create_meeting(
 ):
     """Upload a recording. Returns immediately with status "queued"; poll GET /meetings/{id}
     until status is "completed" (or "failed")."""
-    settings = services.settings
+    runtime = services.load_runtime_settings(db)
     attendee_list = parse_attendees(attendees)
-    language_hint = resolve_language(language, settings)
+    language_hint = resolve_language(language, runtime)
     if category_id is not None:
         get_owned_category(db, user, category_id)
 
-    audio_path, audio_seconds = save_upload(audio, settings)
+    audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
         meeting = Meeting(
             owner_id=user.id,
@@ -313,9 +313,10 @@ def replace_audio(
     meeting = get_owned_meeting(db, user, meeting_id)
     expire_stale(db, [meeting], services.settings)
     ensure_idle(meeting)
+    runtime = services.load_runtime_settings(db)
     if language is not None:
-        meeting.language = resolve_language(language, services.settings)
-    audio_path, audio_seconds = save_upload(audio, services.settings)
+        meeting.language = resolve_language(language, runtime)
+    audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
         if audio_seconds:
             meeting.duration_seconds = round(audio_seconds)

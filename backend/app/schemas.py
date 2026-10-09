@@ -20,7 +20,7 @@ Priority = Literal["high", "medium", "low"]
 
 
 def _to_utc(value: datetime) -> datetime:
-    """Everything is stored in UTC. Naive values (from SQLite, or clients) are taken as UTC."""
+    """Everything is stored and returned in UTC. Naive values sent by clients are taken as UTC."""
     return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
 
 
@@ -53,6 +53,7 @@ class UserOut(ORMModel):
     id: uuid.UUID
     email: str
     full_name: str | None
+    role: Literal["user", "admin"]
     created_at: UTCDateTime
 
 
@@ -71,6 +72,30 @@ class AuthResponse(BaseModel):
     token_type: Literal["bearer"] = "bearer"
     expires_in: int = Field(description="Access token lifetime in seconds")
     user: UserOut
+
+
+# ----------------------------------------------------------------------- admin
+
+
+class AdminUserOut(UserOut):
+    is_active: bool
+    last_login_at: UTCDateTime | None
+    meeting_count: int
+
+
+class AdminUserPage(BaseModel):
+    items: list[AdminUserOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class AdminUserUpdate(BaseModel):
+    """Only the fields sent are changed."""
+
+    role: Literal["user", "admin"] | None = None
+    is_active: bool | None = None
+    full_name: Name | None = None
 
 
 # ------------------------------------------------------------------ categories

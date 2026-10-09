@@ -4,7 +4,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 
-from app.models import Meeting, as_aware
+from app.models import Meeting
 from app.schemas import MeetingSummaryContent
 
 LABELS = {
@@ -166,7 +166,7 @@ def build_view(meeting: Meeting, include_transcript: bool = False) -> MeetingVie
         rtl=rtl,
         labels=labels,
         title=fix(title),
-        date=fix(as_aware(meeting.meeting_date).strftime("%Y-%m-%d")) if meeting.meeting_date else "",
+        date=fix(meeting.meeting_date.strftime("%Y-%m-%d")) if meeting.meeting_date else "",
         duration=fix(format_duration(meeting.duration_seconds)),
         category=fix(meeting.category.name) if meeting.category else "",
         attendees=attendees,

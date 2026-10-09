@@ -17,7 +17,6 @@ from app.models import (
     ActionItemSource,
     Meeting,
     MeetingStatus,
-    as_aware,
     utcnow,
 )
 from app.schemas import LLMMeetingSummary, MeetingSummaryContent
@@ -50,7 +49,7 @@ def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> No
     changed = False
     for meeting in meetings:
         started = meeting.processing_started_at
-        if is_processing(meeting) and started and as_aware(started) < cutoff:
+        if is_processing(meeting) and started and started < cutoff:
             meeting.status = MeetingStatus.FAILED
             meeting.error_message = INTERRUPTED_MESSAGE
             changed = True
@@ -75,7 +74,7 @@ def build_context(meeting: Meeting) -> MeetingContext:
     attendees = [f"{a.name} ({a.role})" if a.role else a.name for a in meeting.attendees]
     return MeetingContext(
         title=meeting.title,
-        meeting_date=as_aware(meeting.meeting_date).date() if meeting.meeting_date else None,
+        meeting_date=meeting.meeting_date.date() if meeting.meeting_date else None,
         category=meeting.category.name if meeting.category else None,
         attendees=attendees,
         duration_minutes=round(meeting.duration_seconds / 60) if meeting.duration_seconds else None,
@@ -124,23 +123,24 @@ def describe_failure(exc: Exception, stage: str) -> str:
 
 def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | None) -> None:
     """Background job. With audio: transcribe then summarize. Without: re-summarize."""
-    settings = services.settings
     stage = "transcription" if audio_path else "summary"
     db = services.session_factory()
     try:
         meeting = db.get(Meeting, meeting_id)
         if meeting is None:
             return
+        # The admin settings as they are now: keys, models and prompt changes apply to the next job.
+        runtime = services.load_runtime_settings(db)
 
         if audio_path is not None:
             meeting.status = MeetingStatus.TRANSCRIBING
             db.commit()
             transcript = transcribe_audio(
-                services.transcriber,
+                services.make_transcriber(runtime),
                 audio_path,
                 audio_path.parent,
                 meeting.language,
-                settings.transcription_chunk_seconds,
+                runtime.transcription_chunk_seconds,
             )
             if not transcript.strip():
                 raise NoSpeechError("No speech was detected in the recording.")
@@ -153,7 +153,7 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | N
         stage = "summary"
         meeting.status = MeetingStatus.SUMMARIZING
         db.commit()
-        summary = services.summarizer.summarize(meeting.transcript, build_context(meeting))
+        summary = services.make_summarizer(runtime).summarize(meeting.transcript, build_context(meeting))
         apply_summary(meeting, summary)
         meeting.status = MeetingStatus.COMPLETED
         meeting.error_message = None

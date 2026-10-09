@@ -11,11 +11,7 @@ from app.models import (
     utcnow,
 )
 from app.security import hash_refresh_token
-from tests.conftest import register
-
-
-def bearer(tokens: dict) -> dict:
-    return {"Authorization": f"Bearer {tokens['access_token']}"}
+from tests.conftest import bearer, register
 
 
 def test_register_returns_tokens_and_user(client):
@@ -23,6 +19,7 @@ def test_register_returns_tokens_and_user(client):
     assert tokens["token_type"] == "bearer"
     assert tokens["expires_in"] == 30 * 60
     assert tokens["user"]["email"] == "sara@example.com"
+    assert tokens["user"]["role"] == "user"
 
     me = client.get("/users/me", headers=bearer(tokens))
     assert me.status_code == 200

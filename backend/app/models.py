@@ -1,9 +1,9 @@
 import enum
 import uuid
 from datetime import UTC, date, datetime
+from typing import Any
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     Date,
     DateTime,
@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -23,9 +24,9 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def as_aware(value: datetime) -> datetime:
-    """SQLite drops tzinfo; everything we store is UTC."""
-    return value if value.tzinfo else value.replace(tzinfo=UTC)
+class UserRole(enum.StrEnum):
+    USER = "user"
+    ADMIN = "admin"
 
 
 class MeetingStatus(enum.StrEnum):
@@ -58,7 +59,9 @@ class User(TimestampMixin, Base):
     email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     full_name: Mapped[str | None] = mapped_column(String(200))
+    role: Mapped[str] = mapped_column(String(20), default=UserRole.USER, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     meetings: Mapped[list["Meeting"]] = relationship(
         back_populates="owner", cascade="all, delete-orphan", passive_deletes=True
@@ -69,6 +72,10 @@ class User(TimestampMixin, Base):
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == UserRole.ADMIN
 
 
 class RefreshToken(Base):
@@ -84,6 +91,21 @@ class RefreshToken(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     user: Mapped[User] = relationship(back_populates="refresh_tokens")
+
+
+class AppSetting(Base):
+    """One admin-managed setting (see app/runtime_settings.py). Secrets are stored encrypted."""
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(100), primary_key=True)
+    value: Mapped[Any] = mapped_column(JSONB)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
 
 
 class Category(TimestampMixin, Base):
@@ -125,7 +147,7 @@ class Meeting(TimestampMixin, Base):
     transcript: Mapped[str | None] = mapped_column(Text)
     # Structured LLM output (overview, what_happened, decisions, parties, ...).
     # Action items live in their own table so users can edit and tick them off.
-    summary: Mapped[dict | None] = mapped_column(JSON)
+    summary: Mapped[dict | None] = mapped_column(JSONB)
 
     owner: Mapped[User] = relationship(back_populates="meetings")
     category: Mapped[Category | None] = relationship()

@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.deps import AppSettings, DbSession
-from app.models import RefreshToken, User, as_aware, utcnow
+from app.models import RefreshToken, User, utcnow
 from app.schemas import (
     AuthResponse,
     LoginRequest,
@@ -77,8 +77,11 @@ def register(body: RegisterRequest, db: DbSession, settings: AppSettings):
 def login(body: LoginRequest, db: DbSession, settings: AppSettings):
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     password_ok = verify_password(body.password, user.password_hash if user else _DUMMY_HASH)
-    if user is None or not password_ok or not user.is_active:
+    if user is None or not password_ok:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
+    if not user.is_active:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has been disabled")
+    user.last_login_at = utcnow()
     return issue_tokens(db, user, settings)
 
 
@@ -94,12 +97,12 @@ def refresh(body: RefreshRequest, db: DbSession, settings: AppSettings):
         raise invalid
     now = utcnow()
     if token.revoked_at is not None:
-        if now - as_aware(token.revoked_at) > REUSE_GRACE:
+        if now - token.revoked_at > REUSE_GRACE:
             # An old, already-rotated token came back: assume it leaked and end all sessions.
             revoke_all_refresh_tokens(db, token.user_id)
             db.commit()
         raise invalid
-    if as_aware(token.expires_at) <= now:
+    if token.expires_at <= now:
         raise invalid
     user = db.get(User, token.user_id)
     if user is None or not user.is_active:

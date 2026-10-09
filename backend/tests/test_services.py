@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.exports.view import LRM, keep_numbers_ltr, looks_arabic
+from app.runtime_settings import RuntimeSettings
 from app.services.audio import iter_chunks, probe
 from app.services.summarizer import (
     MeetingContext,
@@ -45,9 +46,9 @@ def test_probe_reports_missing_audio(audio_dir):
     assert info.has_audio is False
 
 
-def test_transcriber_requires_an_api_key(settings, tmp_path):
-    with pytest.raises(TranscriptionError, match="TRANSCRIPTION_API_KEY"):
-        OpenAICompatibleTranscriber(settings).transcribe_file(tmp_path / "x.flac", "ar")
+def test_transcriber_requires_an_api_key(tmp_path):
+    with pytest.raises(TranscriptionError, match="speech-to-text API key has not been set"):
+        OpenAICompatibleTranscriber(RuntimeSettings()).transcribe_file(tmp_path / "x.flac", "ar")
 
 
 class StubChat:
@@ -64,9 +65,9 @@ class StubChat:
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason=finish)])
 
 
-def make_summarizer(settings, replies):
-    settings.llm_api_key = "test-key"
-    summarizer = OpenAICompatibleSummarizer(settings)
+def make_summarizer(replies, **overrides):
+    runtime = RuntimeSettings().model_copy(update={"llm_api_key": "test-key", **overrides})
+    summarizer = OpenAICompatibleSummarizer(runtime)
     chat = StubChat(replies)
     summarizer._client = SimpleNamespace(chat=SimpleNamespace(completions=chat))
     return summarizer, chat
@@ -88,8 +89,8 @@ VALID = json.dumps(
 )
 
 
-def test_summarizer_parses_json_mode_output(settings):
-    summarizer, chat = make_summarizer(settings, [(VALID, "stop")])
+def test_summarizer_parses_json_mode_output():
+    summarizer, chat = make_summarizer([(VALID, "stop")])
     context = MeetingContext(title="Budget", meeting_date=date(2026, 10, 9), attendees=["Omar"])
     result = summarizer.summarize("we reviewed the budget", context)
 
@@ -103,27 +104,28 @@ def test_summarizer_parses_json_mode_output(settings):
     assert "<transcript>\nwe reviewed the budget\n</transcript>" in request["messages"][1]["content"]
 
 
-def test_summarizer_retries_once_on_invalid_json(settings):
-    summarizer, chat = make_summarizer(settings, [("", "stop"), (VALID, "stop")])
+def test_summarizer_retries_once_on_invalid_json():
+    summarizer, chat = make_summarizer([("", "stop"), (VALID, "stop")])
     assert summarizer.summarize("text", MeetingContext()).title == "Budget review"
     assert len(chat.requests) == 2
 
-    summarizer, _ = make_summarizer(settings, [("{oops", "stop"), ("[]", "stop")])
+    summarizer, _ = make_summarizer([("{oops", "stop"), ("[]", "stop")])
     with pytest.raises(SummarizerError, match="valid summary"):
         summarizer.summarize("text", MeetingContext())
 
 
-def test_summarizer_reports_truncated_output(settings):
-    summarizer, _ = make_summarizer(settings, [('{"title": "cut', "length")])
+def test_summarizer_reports_truncated_output():
+    summarizer, _ = make_summarizer([('{"title": "cut', "length")])
     with pytest.raises(SummarizerError, match="cut off"):
         summarizer.summarize("text", MeetingContext())
 
 
-def test_long_transcripts_are_condensed_before_summarizing(settings):
-    settings.summary_max_transcript_chars = 100
+def test_long_transcripts_are_condensed_before_summarizing():
     transcript = " ".join(f"sentence number {i}." for i in range(30))  # ~600 chars
     parts = len(split_text(transcript, 50))  # condensing uses half the limit per part
-    summarizer, chat = make_summarizer(settings, [("- note", "stop")] * parts + [(VALID, "stop")])
+    summarizer, chat = make_summarizer(
+        [("- note", "stop")] * parts + [(VALID, "stop")], summary_max_transcript_chars=100
+    )
 
     summarizer.summarize(transcript, MeetingContext())
     *note_calls, final = chat.requests
@@ -133,9 +135,17 @@ def test_long_transcripts_are_condensed_before_summarizing(settings):
     assert "[Part 1 of" in final["messages"][1]["content"]
 
 
-def test_summarizer_requires_an_api_key(settings):
-    with pytest.raises(SummarizerError, match="LLM_API_KEY"):
-        OpenAICompatibleSummarizer(settings).summarize("text", MeetingContext())
+def test_summarizer_requires_an_api_key():
+    with pytest.raises(SummarizerError, match="LLM\\) API key has not been set"):
+        OpenAICompatibleSummarizer(RuntimeSettings()).summarize("text", MeetingContext())
+
+
+def test_summarizer_uses_the_admin_prompt_and_model():
+    prompt = "Custom minutes format. Return a json object with the usual keys."
+    summarizer, chat = make_summarizer([(VALID, "stop")], summary_prompt=prompt, llm_model="deepseek-v4")
+    summarizer.summarize("text", MeetingContext())
+    assert chat.requests[0]["model"] == "deepseek-v4"
+    assert chat.requests[0]["messages"][0]["content"] == prompt
 
 
 def test_split_text_prefers_sentence_boundaries():

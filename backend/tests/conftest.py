@@ -1,15 +1,24 @@
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import update
 
 from app.config import Settings
 from app.db import Base, make_engine, make_session_factory
 from app.deps import Services
 from app.main import create_app
+from app.models import AppSetting, User, UserRole
 from app.schemas import LLMMeetingSummary, SummaryActionItem, SummaryParty
+from app.security import SecretBox
+
+# Tests need PostgreSQL: `docker compose up -d db` provides this one.
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/meetings_test"
+)
 
 ARABIC_TRANSCRIPT = (
     "السلام عليكم. نبدأ اجتماع مراجعة خطة الإطلاق. "
@@ -67,25 +76,39 @@ class FakeSummarizer:
 @pytest.fixture
 def settings(tmp_path) -> Settings:
     return Settings(
-        database_url=os.environ.get("TEST_DATABASE_URL") or f"sqlite:///{tmp_path / 'test.db'}",
-        jwt_secret="test-secret-test-secret-test-secret-123",
+        database_url=TEST_DATABASE_URL,
+        secret_key="test-secret-test-secret-test-secret-123",
         work_dir=tmp_path / "work",
-        transcription_api_key="",
-        llm_api_key="",
         _env_file=None,
     )
 
 
 @pytest.fixture
-def services(settings):
+def fakes():
+    """The fake providers, plus the admin settings each one was built with."""
+    return SimpleNamespace(transcriber=FakeTranscriber(), summarizer=FakeSummarizer(), runtimes=[])
+
+
+@pytest.fixture
+def services(settings, fakes):
     engine = make_engine(settings.database_url)
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
+
+    def make_transcriber(runtime):
+        fakes.runtimes.append(runtime)
+        return fakes.transcriber
+
+    def make_summarizer(runtime):
+        fakes.runtimes.append(runtime)
+        return fakes.summarizer
+
     yield Services(
         settings=settings,
         session_factory=make_session_factory(engine),
-        transcriber=FakeTranscriber(),
-        summarizer=FakeSummarizer(),
+        secret_box=SecretBox(settings.secret_key),
+        make_transcriber=make_transcriber,
+        make_summarizer=make_summarizer,
     )
     Base.metadata.drop_all(engine)
     engine.dispose()
@@ -103,10 +126,34 @@ def register(client: TestClient, email="sara@example.com", password="correct-hor
     return response.json()
 
 
+def bearer(tokens: dict) -> dict:
+    return {"Authorization": f"Bearer {tokens['access_token']}"}
+
+
+def promote(services, email: str) -> None:
+    with services.session_factory() as db:
+        db.execute(update(User).where(User.email == email).values(role=UserRole.ADMIN))
+        db.commit()
+
+
+def set_runtime_settings(services, **values) -> None:
+    """Store admin settings directly (non-secret values only)."""
+    with services.session_factory() as db:
+        for key, value in values.items():
+            db.merge(AppSetting(key=key, value=value))
+        db.commit()
+
+
 @pytest.fixture
 def auth(client) -> dict:
-    tokens = register(client)
-    return {"Authorization": f"Bearer {tokens['access_token']}"}
+    return bearer(register(client))
+
+
+@pytest.fixture
+def admin_auth(client, services) -> dict:
+    tokens = register(client, email="admin@example.com")
+    promote(services, "admin@example.com")
+    return bearer(tokens)
 
 
 def make_audio(path: Path, seconds: float, container_args: list[str]) -> Path:

@@ -48,4 +48,4 @@ jobs:
             --no-cpu-throttling --cpu 1 --memory 1Gi \
             --concurrency 10 --min-instances 0 --max-instances 3 --timeout 900 \
             --set-env-vars ENVIRONMENT=production \
-            --set-secrets "DATABASE_URL=meetings-database-url:latest,JWT_SECRET=meetings-jwt-secret:latest,TRANSCRIPTION_API_KEY=meetings-transcription-api-key:latest,LLM_API_KEY=meetings-llm-api-key:latest"
+            --set-secrets "DATABASE_URL=meetings-database-url:latest,SECRET_KEY=meetings-secret-key:latest"

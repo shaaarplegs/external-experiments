@@ -4,12 +4,20 @@ import zipfile
 from datetime import timedelta
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import update
 
+from app.main import create_app
 from app.models import Meeting, MeetingStatus, utcnow
 from app.services.summarizer import SummarizerError
 from app.services.transcription import TranscriptionError
-from tests.conftest import ARABIC_TRANSCRIPT, make_audio, register, sample_summary
+from tests.conftest import (
+    ARABIC_TRANSCRIPT,
+    make_audio,
+    register,
+    sample_summary,
+    set_runtime_settings,
+)
 
 
 def upload(client, auth, audio_path, **form):
@@ -22,7 +30,7 @@ def upload(client, auth, audio_path, **form):
         )
 
 
-def test_upload_transcribes_and_summarizes(client, auth, m4a_file, services):
+def test_upload_transcribes_and_summarizes(client, auth, m4a_file, services, fakes):
     response = upload(client, auth, m4a_file)
     assert response.status_code == 202, response.text
     created = response.json()
@@ -54,11 +62,11 @@ def test_upload_transcribes_and_summarizes(client, auth, m4a_file, services):
     }
     assert items[1]["due_text"] == "قريباً"
     # The default speech language hint is Arabic, and the temp files are cleaned up.
-    assert services.transcriber.calls == [("chunk_0000.flac", "ar")]
+    assert fakes.transcriber.calls == [("chunk_0000.flac", "ar")]
     assert list(services.settings.work_dir.iterdir()) == []
 
 
-def test_upload_metadata_is_kept_and_passed_to_the_summarizer(client, auth, m4a_file, services):
+def test_upload_metadata_is_kept_and_passed_to_the_summarizer(client, auth, m4a_file, services, fakes):
     category = client.post("/categories", json={"name": "المشاريع", "color": "#1F6FEB"}, headers=auth).json()
     attendees = [{"name": "أحمد", "role": "مطور"}, {"name": "Sara", "email": "sara@example.com"}]
     response = upload(
@@ -77,9 +85,9 @@ def test_upload_metadata_is_kept_and_passed_to_the_summarizer(client, auth, m4a_
     assert meeting["meeting_date"].startswith("2026-10-08T05:30:00")
     assert [a["name"] for a in meeting["attendees"]] == ["أحمد", "Sara"]
     assert meeting["language"] is None
-    assert services.transcriber.calls[-1][1] is None  # "auto" -> let Whisper detect
+    assert fakes.transcriber.calls[-1][1] is None  # "auto" -> let Whisper detect
 
-    transcript, context = services.summarizer.calls[-1]
+    transcript, context = fakes.summarizer.calls[-1]
     assert transcript == ARABIC_TRANSCRIPT
     assert context.title == "اجتماع الإطلاق"
     assert context.category == "المشاريع"
@@ -125,74 +133,80 @@ def test_upload_rejects_bad_metadata(client, auth, m4a_file):
     assert upload(client, auth, m4a_file, category_id=foreign_category["id"]).status_code == 404
 
 
-def test_upload_too_large_is_rejected_before_processing(services, auth, client, tmp_path):
-    services.settings.max_upload_mb = 1
-    from fastapi.testclient import TestClient
+def test_upload_over_the_admin_limit_is_rejected(client, auth, services, tmp_path):
+    set_runtime_settings(services, max_upload_mb=1)
+    big = tmp_path / "big.m4a"
+    big.write_bytes(b"0" * (2 * 1024 * 1024))
+    response = upload(client, auth, big)
+    assert response.status_code == 413
+    assert response.json()["detail"] == "Upload is larger than 1 MB"
+    assert list(services.settings.work_dir.iterdir()) == []
 
-    from app.main import create_app
 
+def test_oversized_requests_are_rejected_before_reading(services, auth, tmp_path):
+    services.settings.max_request_mb = 1
     with TestClient(create_app(services=services)) as small_client:
         big = tmp_path / "big.m4a"
         big.write_bytes(b"0" * (2 * 1024 * 1024))
-        response = upload(small_client, auth, big)
-    assert response.status_code == 413
+        assert upload(small_client, auth, big).status_code == 413
 
 
-def test_upload_rejects_recordings_that_are_too_long(client, auth, m4a_file, services):
-    services.settings.max_audio_minutes = 0
-    response = upload(client, auth, m4a_file)
+def test_upload_rejects_recordings_that_are_too_long(client, auth, audio_dir, services):
+    set_runtime_settings(services, max_audio_minutes=1)
+    long_file = make_audio(audio_dir / "long-call.m4a", 65, ["-c:a", "aac", "-b:a", "16k"])
+    response = upload(client, auth, long_file)
     assert response.status_code == 422
     assert "longer than" in response.json()["detail"]
 
 
-def test_transcription_failure_marks_the_meeting_failed(client, auth, m4a_file, services):
-    services.transcriber.error = TranscriptionError("TRANSCRIPTION_API_KEY is not configured on the server")
+def test_transcription_failure_marks_the_meeting_failed(client, auth, m4a_file, services, fakes):
+    fakes.transcriber.error = TranscriptionError("The speech-to-text API key has not been set.")
     meeting_id = upload(client, auth, m4a_file).json()["id"]
     meeting = client.get(f"/meetings/{meeting_id}", headers=auth).json()
     assert meeting["status"] == "failed"
-    assert meeting["error_message"] == "TRANSCRIPTION_API_KEY is not configured on the server"
+    assert meeting["error_message"] == "The speech-to-text API key has not been set."
     assert meeting["transcript"] is None
 
     # The client re-uploads the audio to retry.
-    services.transcriber.error = None
+    fakes.transcriber.error = None
     with m4a_file.open("rb") as f:
         retry = client.post(f"/meetings/{meeting_id}/audio", files={"audio": ("voice.m4a", f)}, headers=auth)
     assert retry.status_code == 202
     assert client.get(f"/meetings/{meeting_id}", headers=auth).json()["status"] == "completed"
 
 
-def test_silent_recording_fails_with_a_clear_message(client, auth, m4a_file, services):
-    services.transcriber.text = ""
+def test_silent_recording_fails_with_a_clear_message(client, auth, m4a_file, services, fakes):
+    fakes.transcriber.text = ""
     meeting = client.get(f"/meetings/{upload(client, auth, m4a_file).json()['id']}", headers=auth).json()
     assert meeting["status"] == "failed"
     assert meeting["error_message"] == "No speech was detected in the recording."
-    assert services.summarizer.calls == []
+    assert fakes.summarizer.calls == []
 
 
-def test_summary_failure_keeps_the_transcript_and_can_be_retried(client, auth, m4a_file, services):
-    services.summarizer.error = SummarizerError("The model did not return a valid summary")
+def test_summary_failure_keeps_the_transcript_and_can_be_retried(client, auth, m4a_file, services, fakes):
+    fakes.summarizer.error = SummarizerError("The model did not return a valid summary")
     meeting_id = upload(client, auth, m4a_file).json()["id"]
     meeting = client.get(f"/meetings/{meeting_id}", headers=auth).json()
     assert meeting["status"] == "failed"
     assert meeting["transcript"] == ARABIC_TRANSCRIPT
     assert meeting["summary"] is None
 
-    services.summarizer.error = None
+    fakes.summarizer.error = None
     assert client.post(f"/meetings/{meeting_id}/summarize", headers=auth).status_code == 202
     meeting = client.get(f"/meetings/{meeting_id}", headers=auth).json()
     assert meeting["status"] == "completed"
     assert len(meeting["action_items"]) == 2
-    assert len(services.transcriber.calls) == 1  # no second transcription
+    assert len(fakes.transcriber.calls) == 1  # no second transcription
 
 
-def test_resummarize_replaces_ai_items_but_keeps_user_items(client, auth, m4a_file, services):
+def test_resummarize_replaces_ai_items_but_keeps_user_items(client, auth, m4a_file, services, fakes):
     meeting_id = upload(client, auth, m4a_file).json()["id"]
     mine = client.post(
         f"/meetings/{meeting_id}/action-items", json={"description": "حجز قاعة الاجتماع"}, headers=auth
     )
     assert mine.status_code == 201
 
-    services.summarizer.result = sample_summary(
+    fakes.summarizer.result = sample_summary(
         action_items=[{"task": "مهمة جديدة من الملخص", "owner": None}], overview="ملخص محدث"
     )
     client.post(f"/meetings/{meeting_id}/summarize", headers=auth)
@@ -204,8 +218,8 @@ def test_resummarize_replaces_ai_items_but_keeps_user_items(client, auth, m4a_fi
     ]
 
 
-def test_retry_endpoints_refuse_while_processing_or_without_transcript(client, auth, m4a_file, services):
-    services.transcriber.error = TranscriptionError("boom")
+def test_retry_endpoints_refuse_while_processing_or_without_transcript(client, auth, m4a_file, services, fakes):
+    fakes.transcriber.error = TranscriptionError("boom")
     meeting_id = upload(client, auth, m4a_file).json()["id"]
     assert client.post(f"/meetings/{meeting_id}/summarize", headers=auth).status_code == 409  # no transcript
 
@@ -232,9 +246,9 @@ def test_stuck_processing_is_reported_as_failed(client, auth, m4a_file, services
     assert listed["error_message"] == "Processing was interrupted. Please retry."
 
 
-def test_list_filters_and_pagination(client, auth, m4a_file, services):
+def test_list_filters_and_pagination(client, auth, m4a_file, services, fakes):
     work = client.post("/categories", json={"name": "Work"}, headers=auth).json()
-    services.summarizer.result = sample_summary(title="")
+    fakes.summarizer.result = sample_summary(title="")
     ids = []
     for index in range(3):
         form = {"title": f"Meeting {index}", "meeting_date": f"2026-10-0{index + 1}T10:00:00Z"}

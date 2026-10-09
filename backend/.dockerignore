@@ -4,3 +4,5 @@
 __pycache__
 .pytest_cache
 tests
+deploy
+docker-compose.yml

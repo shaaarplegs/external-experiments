@@ -2,12 +2,13 @@
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-10-09 08:01:08.516823
+Create Date: 2026-10-09 08:28:20.925987
 
 """
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
@@ -23,12 +24,23 @@ def upgrade() -> None:
     sa.Column('email', sa.String(length=320), nullable=False),
     sa.Column('password_hash', sa.String(length=255), nullable=False),
     sa.Column('full_name', sa.String(length=200), nullable=True),
+    sa.Column('role', sa.String(length=20), nullable=False),
     sa.Column('is_active', sa.Boolean(), nullable=False),
+    sa.Column('last_login_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_users_email'), 'users', ['email'], unique=True)
+    op.create_index(op.f('ix_users_role'), 'users', ['role'], unique=False)
+    op.create_table('app_settings',
+    sa.Column('key', sa.String(length=100), nullable=False),
+    sa.Column('value', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
+    sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
+    sa.Column('updated_by_id', sa.Uuid(), nullable=True),
+    sa.ForeignKeyConstraint(['updated_by_id'], ['users.id'], ondelete='SET NULL'),
+    sa.PrimaryKeyConstraint('key')
+    )
     op.create_table('categories',
     sa.Column('id', sa.Uuid(), nullable=False),
     sa.Column('owner_id', sa.Uuid(), nullable=False),
@@ -67,7 +79,7 @@ def upgrade() -> None:
     sa.Column('processed_at', sa.DateTime(timezone=True), nullable=True),
     sa.Column('source_filename', sa.String(length=255), nullable=True),
     sa.Column('transcript', sa.Text(), nullable=True),
-    sa.Column('summary', sa.JSON(), nullable=True),
+    sa.Column('summary', postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     sa.Column('created_at', sa.DateTime(timezone=True), nullable=False),
     sa.Column('updated_at', sa.DateTime(timezone=True), nullable=False),
     sa.ForeignKeyConstraint(['category_id'], ['categories.id'], ondelete='SET NULL'),
@@ -122,5 +134,7 @@ def downgrade() -> None:
     op.drop_table('refresh_tokens')
     op.drop_index(op.f('ix_categories_owner_id'), table_name='categories')
     op.drop_table('categories')
+    op.drop_table('app_settings')
+    op.drop_index(op.f('ix_users_role'), table_name='users')
     op.drop_index(op.f('ix_users_email'), table_name='users')
     op.drop_table('users')

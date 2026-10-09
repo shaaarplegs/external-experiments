@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Response, status
 
 from app.deps import CurrentUser, DbSession
+from app.routers.admin import ensure_not_last_admin
 from app.routers.auth import revoke_all_refresh_tokens
 from app.schemas import PasswordChange, UserOut, UserUpdate
 from app.security import hash_password, verify_password
@@ -34,6 +35,7 @@ def change_password(body: PasswordChange, user: CurrentUser, db: DbSession):
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 def delete_me(user: CurrentUser, db: DbSession):
     """Deletes the account and all of its meetings (Google Play requires in-app deletion)."""
+    ensure_not_last_admin(db, user)
     db.delete(user)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

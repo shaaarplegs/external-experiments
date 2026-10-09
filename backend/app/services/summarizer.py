@@ -7,10 +7,12 @@ from typing import Protocol
 from openai import OpenAI
 from pydantic import ValidationError
 
-from app.config import Settings
+from app.runtime_settings import RuntimeSettings
 from app.schemas import LLMMeetingSummary
 
 logger = logging.getLogger(__name__)
+
+TIMEOUT_SECONDS = 300
 
 
 class SummarizerError(Exception):
@@ -82,28 +84,30 @@ def split_text(text: str, max_chars: int) -> list[str]:
 class OpenAICompatibleSummarizer:
     """Chat-completions summarizer; DeepSeek by default, any OpenAI-compatible API works."""
 
-    def __init__(self, settings: Settings):
-        self._settings = settings
+    def __init__(self, runtime: RuntimeSettings):
+        self._runtime = runtime
         self._client: OpenAI | None = None
 
     def _get_client(self) -> OpenAI:
-        if not self._settings.llm_api_key:
-            raise SummarizerError("LLM_API_KEY is not configured on the server")
+        if not self._runtime.llm_api_key:
+            raise SummarizerError(
+                "The summary (LLM) API key has not been set. An admin can add it in the admin settings."
+            )
         if self._client is None:
             self._client = OpenAI(
-                base_url=self._settings.llm_base_url,
-                api_key=self._settings.llm_api_key,
-                timeout=self._settings.llm_timeout_seconds,
+                base_url=self._runtime.llm_base_url,
+                api_key=self._runtime.llm_api_key,
+                timeout=TIMEOUT_SECONDS,
                 max_retries=3,
             )
         return self._client
 
     def _chat(self, system: str, user: str, *, json_mode: bool) -> str:
         kwargs = {
-            "model": self._settings.llm_model,
+            "model": self._runtime.llm_model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": self._settings.llm_temperature,
-            "max_tokens": self._settings.llm_max_tokens,
+            "temperature": self._runtime.llm_temperature,
+            "max_tokens": self._runtime.llm_max_tokens,
         }
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -114,24 +118,24 @@ class OpenAICompatibleSummarizer:
         return choice.message.content or ""
 
     def _condense(self, transcript: str) -> str:
-        notes_prompt = self._settings.notes_prompt_path.read_text(encoding="utf-8")
-        parts = split_text(transcript, self._settings.summary_max_transcript_chars // 2)
+        parts = split_text(transcript, self._runtime.summary_max_transcript_chars // 2)
         notes = []
         for index, part in enumerate(parts, start=1):
             logger.info("Condensing transcript part %s/%s", index, len(parts))
-            body = self._chat(notes_prompt, f"Part {index} of {len(parts)}:\n\n{part}", json_mode=False)
+            body = self._chat(
+                self._runtime.notes_prompt, f"Part {index} of {len(parts)}:\n\n{part}", json_mode=False
+            )
             notes.append(f"[Part {index} of {len(parts)}]\n{body.strip()}")
         return "\n\n".join(notes)
 
     def summarize(self, transcript: str, context: MeetingContext) -> LLMMeetingSummary:
-        system_prompt = self._settings.summary_prompt_path.read_text(encoding="utf-8")
-        condensed = len(transcript) > self._settings.summary_max_transcript_chars
+        condensed = len(transcript) > self._runtime.summary_max_transcript_chars
         text = self._condense(transcript) if condensed else transcript
         user_message = build_user_message(text, context, condensed)
 
         last_error: Exception | None = None
         for attempt in range(2):  # JSON mode occasionally returns empty or partial output
-            content = self._chat(system_prompt, user_message, json_mode=True)
+            content = self._chat(self._runtime.summary_prompt, user_message, json_mode=True)
             try:
                 return LLMMeetingSummary.model_validate(json.loads(content))
             except (json.JSONDecodeError, ValidationError) as exc:

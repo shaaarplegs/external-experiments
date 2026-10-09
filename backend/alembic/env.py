@@ -31,16 +31,11 @@ def run_migrations_offline() -> None:
 def run_migrations_online() -> None:
     engine = make_engine(get_settings().database_url)
     with engine.connect() as connection:
-        context.configure(
-            connection=connection,
-            target_metadata=target_metadata,
-            render_as_batch=connection.dialect.name == "sqlite",
-        )
+        context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
-            if connection.dialect.name == "postgresql":
-                # Several Cloud Run instances may start at once; only one migrates at a time.
-                # A transaction-scoped lock also works through Neon's PgBouncer pooler.
-                connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": MIGRATION_LOCK_ID})
+            # Several Cloud Run instances may start at once; only one migrates at a time.
+            # A transaction-scoped lock also works through Neon's PgBouncer pooler.
+            connection.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": MIGRATION_LOCK_ID})
             context.run_migrations()
     engine.dispose()
 
