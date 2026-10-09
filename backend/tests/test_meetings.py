@@ -416,3 +416,10 @@ def test_categories_crud(client, auth, m4a_file):
 
 def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
+
+
+def test_admin_panel_is_served(client):
+    page = client.get("/panel/")
+    assert page.status_code == 200 and "Meetings Admin" in page.text
+    assert client.get("/panel/app.js").status_code == 200
+    assert client.get("/", follow_redirects=False).headers["location"] == "/panel/"

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meetings Admin</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="card login-card">
+    <h1>Meetings Admin</h1>
+    <label>Email <input type="email" name="email" autocomplete="username" required></label>
+    <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+    <p class="error" id="login-error" role="alert"></p>
+    <button type="submit">Sign in</button>
+  </form>
+</div>
+
+<div id="shell" class="shell" hidden>
+  <nav class="sidebar">
+    <div class="brand">Meetings Admin</div>
+    <a href="#/dashboard" data-nav="dashboard">Dashboard</a>
+    <a href="#/users" data-nav="users">Users</a>
+    <a href="#/meetings" data-nav="meetings">Meetings</a>
+    <a href="#/settings" data-nav="settings">Settings</a>
+    <a href="#/audit" data-nav="audit">Audit log</a>
+    <div class="sidebar-foot">
+      <span id="me" class="muted"></span>
+      <button id="logout" class="link">Sign out</button>
+    </div>
+  </nav>
+  <main id="view" class="view" tabindex="-1"></main>
+</div>
+
+<div id="toast" class="toast" role="status" hidden></div>
+<div id="tooltip" class="tooltip" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>

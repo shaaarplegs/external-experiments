@@ -100,8 +100,10 @@ Every account has a role: `user` (default) or `admin`. Admins have full control:
   accounts, deleted meetings), with the admin's email and time. Settings entries list which
   fields changed, never values.
 
-Until the admin panel exists, Swagger UI at `/docs` works as one: log in with
-`POST /auth/login`, click **Authorize**, paste the `access_token`, then use the `admin` endpoints.
+**Admin panel:** open `<server>/panel` (the server root redirects there) and sign in with an
+admin account. It has the dashboard, users (revoke/restore access, quotas, roles), every
+meeting (summary, transcript, export, delete), settings and the audit log. It is served by the
+API itself, so there is nothing else to deploy.
 
 **The seeded admin.** Set `ADMIN_EMAIL` and `ADMIN_PASSWORD`; on startup, if no account with
 that email exists, it is created as an admin. Later starts leave it alone, so change the

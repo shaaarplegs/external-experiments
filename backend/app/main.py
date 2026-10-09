@@ -3,9 +3,11 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from app.config import DEV_SECRET_KEY, Settings, get_settings
+from app.config import APP_DIR, DEV_SECRET_KEY, Settings, get_settings
 from app.db import make_engine, make_session_factory
 from app.deps import Services
 from app.routers import admin, auth, categories, meetings, users
@@ -21,7 +23,7 @@ summary and action items. Meetings can be categorized, edited and exported as PD
 Authenticate with `POST /auth/login` (or `/auth/register`), then send
 `Authorization: Bearer <access_token>`. Refresh with `POST /auth/refresh` before it expires.
 
-Admins (users with role `admin`) have their own endpoints under `/admin`: global settings
+The admin panel is at `/panel`. Admins (users with role `admin`) have their own endpoints under `/admin`: global settings
 (provider API keys, models, the summary prompt, limits, quotas), the usage dashboard, accounts
 (revoke access, quotas), every user's meetings, and the audit log of admin actions.
 """
@@ -91,5 +93,12 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     @app.get("/healthz", tags=["health"])
     def healthz():
         return {"status": "ok"}
+
+    # The admin panel: static files on the same origin as the API (no CORS needed).
+    app.mount("/panel", StaticFiles(directory=APP_DIR / "panel", html=True), name="panel")
+
+    @app.get("/", include_in_schema=False)
+    def root():
+        return RedirectResponse("/panel/")
 
     return app
