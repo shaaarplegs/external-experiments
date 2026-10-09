@@ -1,13 +1,16 @@
 import json
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from starlette.concurrency import run_in_threadpool
 
 from app.config import DEV_SECRET_KEY, Settings, get_settings
 from app.db import make_engine, make_session_factory
 from app.deps import Services
 from app.routers import admin, auth, categories, meetings, users
 from app.security import SecretBox
+from app.seed import seed_admin_from_settings
 from app.services.summarizer import OpenAICompatibleSummarizer
 from app.services.transcription import OpenAICompatibleTranscriber
 
@@ -66,7 +69,15 @@ def create_app(settings: Settings | None = None, services: Services | None = Non
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     settings.work_dir.mkdir(parents=True, exist_ok=True)
 
-    app = FastAPI(title=settings.app_name, version="0.1.0", description=DESCRIPTION)
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        services = app.state.services
+        await run_in_threadpool(
+            seed_admin_from_settings, services.session_factory, settings.admin_email, settings.admin_password
+        )
+        yield
+
+    app = FastAPI(title=settings.app_name, version="0.1.0", description=DESCRIPTION, lifespan=lifespan)
     app.state.services = services or build_services(settings)
     app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.max_request_mb * 1024 * 1024)
 

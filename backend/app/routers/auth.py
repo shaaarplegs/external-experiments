@@ -1,7 +1,7 @@
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -32,12 +32,16 @@ _DUMMY_HASH = hash_password("dummy-password-for-timing")
 
 
 def issue_tokens(db: Session, user: User, settings: Settings) -> AuthResponse:
+    now = utcnow()
+    user.last_active_at = now
+    # Housekeeping: a user's expired refresh tokens are of no further use.
+    db.execute(delete(RefreshToken).where(RefreshToken.user_id == user.id, RefreshToken.expires_at < now))
     raw = new_refresh_token()
     db.add(
         RefreshToken(
             user_id=user.id,
             token_hash=hash_refresh_token(raw),
-            expires_at=utcnow() + timedelta(days=settings.refresh_token_ttl_days),
+            expires_at=now + timedelta(days=settings.refresh_token_ttl_days),
         )
     )
     db.commit()
@@ -63,7 +67,9 @@ def register(body: RegisterRequest, db: DbSession, settings: AppSettings):
     conflict = HTTPException(status.HTTP_409_CONFLICT, "An account with this email already exists")
     if db.scalar(select(User.id).where(User.email == email)):
         raise conflict
-    user = User(email=email, password_hash=hash_password(body.password), full_name=body.full_name)
+    user = User(
+        email=email, password_hash=hash_password(body.password), full_name=body.full_name, last_login_at=utcnow()
+    )
     db.add(user)
     try:
         db.flush()
@@ -80,7 +86,10 @@ def login(body: LoginRequest, db: DbSession, settings: AppSettings):
     if user is None or not password_ok:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect email or password")
     if not user.is_active:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "This account has been disabled")
+        detail = "This account has been disabled"
+        if user.disabled_reason:
+            detail += f": {user.disabled_reason}"
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail)
     user.last_login_at = utcnow()
     return issue_tokens(db, user, settings)
 

@@ -1,11 +1,17 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Annotated
 
-from pydantic import Field
+from pydantic import BeforeValidator, EmailStr, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 APP_DIR = Path(__file__).resolve().parent
 DEV_SECRET_KEY = "dev-only-change-me-dev-only-change-me"
+
+
+def _empty_as_none(value):
+    """An env var that is set but empty (e.g. an unset CI variable) means "not configured"."""
+    return None if value == "" else value
 
 
 class Settings(BaseSettings):
@@ -29,6 +35,13 @@ class Settings(BaseSettings):
     secret_key: str = Field(default=DEV_SECRET_KEY, min_length=32)
     access_token_ttl_minutes: int = 30
     refresh_token_ttl_days: int = 30
+
+    # Seeded admin: created at startup if no account with this email exists yet. The
+    # password is only used for that first creation; change it in the app afterwards.
+    admin_email: Annotated[EmailStr | None, BeforeValidator(_empty_as_none)] = None
+    admin_password: Annotated[str | None, BeforeValidator(_empty_as_none)] = Field(
+        default=None, min_length=8, repr=False
+    )
 
     # Hard cap on any request body. Cloud Run rejects HTTP/1 bodies over 32 MiB anyway;
     # the (lower) per-upload limit is an admin setting.

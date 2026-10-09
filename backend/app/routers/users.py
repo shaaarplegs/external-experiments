@@ -1,10 +1,11 @@
 from fastapi import APIRouter, HTTPException, Response, status
 
-from app.deps import CurrentUser, DbSession
+from app.deps import AppServices, CurrentUser, DbSession
 from app.routers.admin import ensure_not_last_admin
 from app.routers.auth import revoke_all_refresh_tokens
-from app.schemas import PasswordChange, UserOut, UserUpdate
+from app.schemas import PasswordChange, UsageOut, UserOut, UserUpdate
 from app.security import hash_password, verify_password
+from app.services.usage import monthly_usage
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -12,6 +13,20 @@ router = APIRouter(prefix="/users", tags=["users"])
 @router.get("/me", response_model=UserOut)
 def get_me(user: CurrentUser):
     return user
+
+
+@router.get("/me/usage", response_model=UsageOut)
+def get_my_usage(user: CurrentUser, db: DbSession, services: AppServices):
+    """Uploads and audio minutes used this month, and the limits (null = unlimited)."""
+    usage = monthly_usage(db, user, services.load_runtime_settings(db))
+    return UsageOut(
+        period_start=usage.period_start,
+        period_end=usage.period_end,
+        uploads=usage.uploads,
+        uploads_limit=usage.uploads_limit,
+        audio_minutes=usage.audio_minutes,
+        audio_minutes_limit=usage.audio_minutes_limit,
+    )
 
 
 @router.patch("/me", response_model=UserOut)

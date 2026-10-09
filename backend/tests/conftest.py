@@ -65,6 +65,7 @@ class FakeSummarizer:
         self.calls = []
         self.result = sample_summary()
         self.error: Exception | None = None
+        self.tokens_used = (1200, 300)  # reported even when summarizing fails
 
     def summarize(self, transcript, context):
         self.calls.append((transcript, context))

@@ -117,11 +117,14 @@ def test_list_and_view_users(client, admin_auth, auth, m4a_file):
     by_email = {u["email"]: u for u in page["items"]}
     assert by_email["sara@example.com"]["meeting_count"] == 1
     assert by_email["admin@example.com"]["role"] == "admin"
-    assert by_email["omar@example.com"]["last_login_at"] is None
+    registered = by_email["omar@example.com"]
+    assert registered["last_login_at"] is not None  # registering signs the user in
+    assert registered["last_active_at"] >= registered["last_login_at"]
 
     client.post("/auth/login", json={"email": "omar@example.com", "password": "correct-horse-1"})
-    omar = client.get(f"/admin/users/{by_email['omar@example.com']['id']}", headers=admin_auth).json()
-    assert omar["last_login_at"] is not None
+    omar = client.get(f"/admin/users/{registered['id']}", headers=admin_auth).json()
+    assert omar["last_login_at"] > registered["last_login_at"]
+    assert omar["last_active_at"] >= omar["last_login_at"]
     assert omar["is_active"] is True and omar["meeting_count"] == 0
 
     def emails(**params):

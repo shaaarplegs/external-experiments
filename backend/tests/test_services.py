@@ -6,7 +6,7 @@ import pytest
 
 from app.exports.view import LRM, keep_numbers_ltr, looks_arabic
 from app.runtime_settings import RuntimeSettings
-from app.services.audio import iter_chunks, probe
+from app.services.audio import iter_chunks, normalize, probe
 from app.services.summarizer import (
     MeetingContext,
     OpenAICompatibleSummarizer,
@@ -20,7 +20,9 @@ from tests.conftest import make_audio
 
 def test_split_for_transcription_makes_16k_mono_flac_chunks(audio_dir, tmp_path):
     source = make_audio(audio_dir / "long.m4a", 25, ["-ac", "2", "-ar", "44100", "-c:a", "aac"])
-    chunks = list(iter_chunks(source, tmp_path / "chunks", chunk_seconds=10))
+    audio = normalize(source, tmp_path / "chunks")
+    assert round(audio.duration_seconds) == 25
+    chunks = list(iter_chunks(audio, chunk_seconds=10))
     assert [c.name for c in chunks] == ["chunk_0000.flac", "chunk_0001.flac", "chunk_0002.flac"]
     durations = [round(probe(c).duration_seconds) for c in chunks]
     assert durations == [10, 10, 5]
@@ -29,7 +31,7 @@ def test_split_for_transcription_makes_16k_mono_flac_chunks(audio_dir, tmp_path)
 
 def test_split_drops_a_near_empty_trailing_chunk(audio_dir, tmp_path):
     source = make_audio(audio_dir / "edge.wav", 20.4, [])
-    chunks = list(iter_chunks(source, tmp_path / "chunks", chunk_seconds=10))
+    chunks = list(iter_chunks(normalize(source, tmp_path / "chunks"), chunk_seconds=10))
     assert len(chunks) == 2
 
 

@@ -54,6 +54,8 @@ NotesPrompt = Annotated[str, StringConstraints(min_length=20, max_length=50_000)
 TranscriptChars = Annotated[int, Field(ge=5_000, le=500_000)]
 UploadMb = Annotated[int, Field(ge=1, le=32, description="Cloud Run rejects request bodies over 32 MiB")]
 AudioMinutes = Annotated[int, Field(ge=1, le=600)]
+MonthlyCount = Annotated[int, Field(ge=1, le=1_000_000)]
+Price = Annotated[float, Field(ge=0, le=10_000)]
 
 
 class RuntimeSettings(BaseModel):
@@ -76,9 +78,19 @@ class RuntimeSettings(BaseModel):
     notes_prompt: NotesPrompt = Field(DEFAULT_NOTES_PROMPT, description="Condenses very long transcripts")
     summary_max_transcript_chars: TranscriptChars = 60_000
 
-    # Limits
+    # Limits per upload
     max_upload_mb: UploadMb = 30
     max_audio_minutes: AudioMinutes = 180
+
+    # Monthly quotas per user (calendar month, UTC); None = unlimited. Admins can override
+    # them for individual users.
+    quota_uploads_per_month: MonthlyCount | None = None
+    quota_audio_minutes_per_month: MonthlyCount | None = None
+
+    # Optional prices, only used to estimate spend on the dashboard; None = not shown.
+    price_transcription_per_hour_usd: Price | None = None
+    price_llm_input_per_million_tokens_usd: Price | None = None
+    price_llm_output_per_million_tokens_usd: Price | None = None
 
     @property
     def language_hint(self) -> str | None:
@@ -87,7 +99,8 @@ class RuntimeSettings(BaseModel):
 
 class RuntimeSettingsUpdate(BaseModel):
     """PATCH body: only the fields sent are changed. For API keys, an empty string or null
-    removes the key; for any other field, null resets it to the default."""
+    removes the key; for any other field, null resets it to the default (for quotas and
+    prices the default is "none": unlimited / not shown)."""
 
     transcription_base_url: Url | None = None
     transcription_api_key: ApiKey | None = None
@@ -104,6 +117,11 @@ class RuntimeSettingsUpdate(BaseModel):
     summary_max_transcript_chars: TranscriptChars | None = None
     max_upload_mb: UploadMb | None = None
     max_audio_minutes: AudioMinutes | None = None
+    quota_uploads_per_month: MonthlyCount | None = None
+    quota_audio_minutes_per_month: MonthlyCount | None = None
+    price_transcription_per_hour_usd: Price | None = None
+    price_llm_input_per_million_tokens_usd: Price | None = None
+    price_llm_output_per_million_tokens_usd: Price | None = None
 
 
 class SecretStatus(BaseModel):
@@ -129,6 +147,11 @@ class RuntimeSettingsOut(BaseModel):
     summary_max_transcript_chars: int
     max_upload_mb: int
     max_audio_minutes: int
+    quota_uploads_per_month: int | None
+    quota_audio_minutes_per_month: int | None
+    price_transcription_per_hour_usd: float | None
+    price_llm_input_per_million_tokens_usd: float | None
+    price_llm_output_per_million_tokens_usd: float | None
 
     @classmethod
     def from_settings(cls, runtime: RuntimeSettings) -> "RuntimeSettingsOut":

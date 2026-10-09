@@ -80,7 +80,7 @@ def try_command(args: argparse.Namespace) -> None:
         language = runtime.language_hint if args.language is None else args.language
         work_dir = Path(tempfile.mkdtemp(prefix="meeting-cli-"))
         try:
-            transcript = transcribe_audio(
+            transcript, _ = transcribe_audio(
                 OpenAICompatibleTranscriber(runtime),
                 args.audio,
                 work_dir,

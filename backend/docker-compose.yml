@@ -25,6 +25,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/meetings
       SECRET_KEY: local-dev-secret-local-dev-secret-local
+      ADMIN_EMAIL: admin@example.com
+      ADMIN_PASSWORD: local-admin-password
       PORT: "8000"
     ports: ["8000:8000"]
 

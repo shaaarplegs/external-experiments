@@ -52,37 +52,49 @@ def _ffmpeg(args: list[str], timeout: float) -> None:
         raise AudioError(f"Could not decode the audio: {result.stderr.strip()[-300:]}")
 
 
-def iter_chunks(src: Path, out_dir: Path, chunk_seconds: int) -> Iterator[Path]:
-    """Extract the first audio track as 16 kHz mono FLAC and yield fixed-length chunks.
+@dataclass
+class NormalizedAudio:
+    path: Path
+    duration_seconds: float
 
-    Whisper works on 16 kHz mono internally, so this loses nothing, and the chunks stay
-    well under the 25 MB per-request limit of hosted Whisper APIs. Decoding everything once
-    first also gives a reliable length for files whose headers lack one (e.g. Android webm).
-    Chunks are cut one at a time so the caller can delete each after use: Cloud Run's /tmp
-    lives in memory.
+
+def normalize(src: Path, out_dir: Path) -> NormalizedAudio:
+    """Extract the first audio track as 16 kHz mono FLAC.
+
+    Whisper works on 16 kHz mono internally, so this loses nothing. Decoding everything once
+    also gives a reliable length for files whose headers lack one (e.g. Android webm).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    normalized = out_dir / "normalized.flac"
+    path = out_dir / "normalized.flac"
     _ffmpeg(["-i", str(src), "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "16000", "-c:a", "flac",
-             str(normalized)], timeout=900)
-    duration = probe(normalized).duration_seconds
+             str(path)], timeout=900)
+    duration = probe(path).duration_seconds
     if not duration:
         raise AudioError("Could not determine the length of the recording")
+    return NormalizedAudio(path, duration)
 
-    if duration <= chunk_seconds:
+
+def iter_chunks(audio: NormalizedAudio, chunk_seconds: int) -> Iterator[Path]:
+    """Yield fixed-length chunks, well under the 25 MB per-request limit of hosted Whisper.
+
+    Chunks are cut one at a time so the caller can delete each after use (Cloud Run's /tmp
+    lives in memory); the normalized file is deleted at the end.
+    """
+    out_dir = audio.path.parent
+    if audio.duration_seconds <= chunk_seconds:
         first_chunk = out_dir / "chunk_0000.flac"
-        normalized.rename(first_chunk)
+        audio.path.rename(first_chunk)
         yield first_chunk
         return
 
     try:
         index, start = 0, 0
-        while duration - start >= MIN_CHUNK_SECONDS:
+        while audio.duration_seconds - start >= MIN_CHUNK_SECONDS:
             chunk = out_dir / f"chunk_{index:04d}.flac"
             # Re-encoding (cheap for FLAC) writes a correct length into each chunk's header.
-            _ffmpeg(["-ss", str(start), "-i", str(normalized), "-t", str(chunk_seconds),
+            _ffmpeg(["-ss", str(start), "-i", str(audio.path), "-t", str(chunk_seconds),
                      "-c:a", "flac", str(chunk)], timeout=300)
             yield chunk
             index, start = index + 1, start + chunk_seconds
     finally:
-        normalized.unlink(missing_ok=True)
+        audio.path.unlink(missing_ok=True)

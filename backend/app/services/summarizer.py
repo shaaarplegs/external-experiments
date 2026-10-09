@@ -33,6 +33,12 @@ class MeetingContext:
 class Summarizer(Protocol):
     def summarize(self, transcript: str, context: MeetingContext) -> LLMMeetingSummary: ...
 
+    @property
+    def tokens_used(self) -> tuple[int, int]:
+        """(prompt, completion) tokens across every model call so far, including calls made
+        before a failure; recorded for the usage dashboard."""
+        ...
+
 
 def build_user_message(transcript: str, context: MeetingContext, condensed: bool) -> str:
     def show(value) -> str:
@@ -87,6 +93,8 @@ class OpenAICompatibleSummarizer:
     def __init__(self, runtime: RuntimeSettings):
         self._runtime = runtime
         self._client: OpenAI | None = None
+        self._prompt_tokens = 0
+        self._completion_tokens = 0
 
     def _get_client(self) -> OpenAI:
         if not self._runtime.llm_api_key:
@@ -102,6 +110,10 @@ class OpenAICompatibleSummarizer:
             )
         return self._client
 
+    @property
+    def tokens_used(self) -> tuple[int, int]:
+        return self._prompt_tokens, self._completion_tokens
+
     def _chat(self, system: str, user: str, *, json_mode: bool) -> str:
         kwargs = {
             "model": self._runtime.llm_model,
@@ -112,6 +124,10 @@ class OpenAICompatibleSummarizer:
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         response = self._get_client().chat.completions.create(**kwargs)
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self._prompt_tokens += usage.prompt_tokens or 0
+            self._completion_tokens += usage.completion_tokens or 0
         choice = response.choices[0]
         if choice.finish_reason == "length":
             raise SummarizerError("The model's answer was cut off (output token limit reached)")

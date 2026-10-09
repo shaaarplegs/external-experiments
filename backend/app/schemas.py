@@ -77,10 +77,28 @@ class AuthResponse(BaseModel):
 # ----------------------------------------------------------------------- admin
 
 
+class UsageOut(BaseModel):
+    """This calendar month's usage (UTC). A null limit means unlimited."""
+
+    period_start: UTCDateTime
+    period_end: UTCDateTime
+    uploads: int
+    uploads_limit: int | None
+    audio_minutes: float
+    audio_minutes_limit: int | None
+
+
 class AdminUserOut(UserOut):
     is_active: bool
+    disabled_reason: str | None
+    disabled_at: UTCDateTime | None
     last_login_at: UTCDateTime | None
+    last_active_at: UTCDateTime | None
     meeting_count: int
+    uploads_this_month: int
+    audio_minutes_this_month: float
+    quota_uploads_per_month: int | None = Field(description="Override; null = the global default")
+    quota_audio_minutes_per_month: int | None = Field(description="Override; null = the global default")
 
 
 class AdminUserPage(BaseModel):
@@ -94,8 +112,17 @@ class AdminUserUpdate(BaseModel):
     """Only the fields sent are changed."""
 
     role: Literal["user", "admin"] | None = None
-    is_active: bool | None = None
+    is_active: bool | None = Field(None, description="false revokes access: signed out everywhere at once")
+    disabled_reason: Annotated[str, StringConstraints(strip_whitespace=True, max_length=1000)] | None = Field(
+        None, description="Shown to the user when they try to log in"
+    )
     full_name: Name | None = None
+    quota_uploads_per_month: Annotated[int, Field(ge=1, le=1_000_000)] | None = Field(
+        None, description="Monthly upload limit for this user; null = the global default"
+    )
+    quota_audio_minutes_per_month: Annotated[int, Field(ge=1, le=1_000_000)] | None = Field(
+        None, description="Monthly audio-minutes limit for this user; null = the global default"
+    )
 
 
 # ------------------------------------------------------------------ categories
@@ -276,3 +303,118 @@ class MeetingPage(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# --------------------------------------------------------------- admin: meetings
+
+
+class OwnerRef(BaseModel):
+    id: uuid.UUID
+    email: str
+    full_name: str | None
+    is_active: bool
+
+
+class AdminMeetingListItem(MeetingListItem):
+    owner: OwnerRef
+
+
+class AdminMeetingDetail(MeetingDetail):
+    owner: OwnerRef
+
+
+class AdminMeetingPage(BaseModel):
+    items: list[AdminMeetingListItem]
+    total: int
+    limit: int
+    offset: int
+
+
+# ------------------------------------------------------------- admin: audit log
+
+
+class AuditLogEntry(ORMModel):
+    id: uuid.UUID
+    admin_id: uuid.UUID | None
+    admin_email: str
+    action: str
+    target_type: str | None
+    target_id: str | None
+    details: dict | None
+    created_at: UTCDateTime
+
+
+class AuditLogPage(BaseModel):
+    items: list[AuditLogEntry]
+    total: int
+    limit: int
+    offset: int
+
+
+# ------------------------------------------------------------- admin: dashboard
+
+
+class CountItem(BaseModel):
+    label: str
+    count: int
+
+
+class DailyPoint(BaseModel):
+    date: date
+    uploads: int
+    audio_minutes: float
+    new_users: int
+    failed_jobs: int
+
+
+class TopUser(BaseModel):
+    user_id: uuid.UUID | None = Field(description="null if the account was deleted")
+    email: str | None
+    uploads: int
+    audio_minutes: float
+
+
+class DashboardUsers(BaseModel):
+    total: int
+    active: int = Field(description="Used the app (signed in, refreshed a session or uploaded) during the period")
+    new: int
+    disabled: int
+    admins: int
+
+
+class DashboardMeetings(BaseModel):
+    total: int = Field(description="Meetings that exist now")
+    created: int = Field(description="Created during the period")
+    completed: int
+    failed: int
+    processing: int
+
+
+class DashboardUsage(BaseModel):
+    uploads: int
+    audio_minutes: float = Field(description="Audio actually transcribed")
+    average_recording_minutes: float | None
+    summaries_regenerated: int
+    jobs: int
+    failed_jobs: int
+    failure_rate: float | None = Field(description="Failed / finished jobs, 0-1")
+    average_processing_seconds: float | None
+    llm_prompt_tokens: int
+    llm_completion_tokens: int
+    estimated_transcription_cost_usd: float | None = Field(description="null until a price is set")
+    estimated_llm_cost_usd: float | None = Field(description="null until a price is set")
+    estimated_cost_usd: float | None
+
+
+class Dashboard(BaseModel):
+    period_start: UTCDateTime
+    period_end: UTCDateTime
+    days: int
+    users: DashboardUsers
+    meetings: DashboardMeetings
+    usage: DashboardUsage
+    daily: list[DailyPoint]
+    top_categories: list[CountItem] = Field(description="What people use the app for, by category name")
+    top_topics: list[CountItem] = Field(description="Topics the summaries detected")
+    languages: list[CountItem]
+    top_users: list[TopUser]

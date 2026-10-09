@@ -1,21 +1,78 @@
+"""Admin API: settings, dashboard, accounts, all meetings, and the audit log.
+
+Admins have full access to every meeting (including transcripts) so they can act on misuse,
+for example by revoking an account. Every action that reads private content or changes an
+account or setting is written to the audit log.
+"""
+
 import uuid
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from app.deps import AppServices, CurrentAdmin, DbSession
-from app.models import Meeting, User, UserRole
+from app.deps import AppServices, AppSettings, CurrentAdmin, DbSession
+from app.models import AdminAuditLog, Meeting, MeetingStatus, User, UserRole, utcnow
 from app.routers.auth import revoke_all_refresh_tokens
+from app.routers.meetings import (
+    EXPORT_RESPONSES,
+    export_response,
+    to_detail,
+    to_list_item,
+)
 from app.runtime_settings import (
+    SECRET_FIELDS,
     RuntimeSettingsOut,
     RuntimeSettingsUpdate,
     update_runtime_settings,
 )
-from app.schemas import AdminUserOut, AdminUserPage, AdminUserUpdate
+from app.schemas import (
+    AdminMeetingDetail,
+    AdminMeetingListItem,
+    AdminMeetingPage,
+    AdminUserOut,
+    AdminUserPage,
+    AdminUserUpdate,
+    AuditLogEntry,
+    AuditLogPage,
+    Dashboard,
+    OwnerRef,
+    UTCDateTime,
+)
+from app.services.dashboard import build_dashboard
+from app.services.pipeline import expire_stale
+from app.services.usage import usage_by_user
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+_MEETING_LOAD = (
+    selectinload(Meeting.attendees),
+    selectinload(Meeting.action_items),
+    selectinload(Meeting.category),
+    selectinload(Meeting.owner),
+)
+
+
+def audit(
+    db: Session,
+    admin: User,
+    action: str,
+    target_type: str | None = None,
+    target_id: Any = None,
+    details: dict | None = None,
+) -> None:
+    """Add an audit entry; it is saved with the caller's commit."""
+    db.add(
+        AdminAuditLog(
+            admin_id=admin.id,
+            admin_email=admin.email,
+            action=action,
+            target_type=target_type,
+            target_id=str(target_id) if target_id is not None else None,
+            details=details,
+        )
+    )
 
 
 # ------------------------------------------------------------------- settings
@@ -23,14 +80,33 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 @router.get("/settings", response_model=RuntimeSettingsOut)
 def get_settings(admin: CurrentAdmin, db: DbSession, services: AppServices):
-    """Provider settings, the summary prompt and limits. API keys are never returned."""
+    """Global technical settings: provider URLs, models, API keys (never returned, only
+    whether they are set), the summary prompt, upload limits, quotas and prices."""
     return RuntimeSettingsOut.from_settings(services.load_runtime_settings(db))
 
 
 @router.patch("/settings", response_model=RuntimeSettingsOut)
 def update_settings(body: RuntimeSettingsUpdate, admin: CurrentAdmin, db: DbSession, services: AppServices):
     """Change only the fields sent. Applies to the next upload or summary on every instance."""
+    changed = sorted(body.model_fields_set)
+    audit(db, admin, "settings.update", details={"fields": changed, "secrets_changed": sorted(SECRET_FIELDS & set(changed))})
     return RuntimeSettingsOut.from_settings(update_runtime_settings(db, services.secret_box, body, admin.id))
+
+
+# ------------------------------------------------------------------ dashboard
+
+
+@router.get("/dashboard", response_model=Dashboard)
+def get_dashboard(
+    admin: CurrentAdmin,
+    db: DbSession,
+    services: AppServices,
+    days: Annotated[int, Query(ge=1, le=366, description="Period: the last N days, including today")] = 30,
+):
+    """KPIs for the period: users, meetings, usage (uploads, minutes, tokens, failures,
+    estimated cost), a daily series, and what the app is used for (categories, topics,
+    languages), plus the heaviest users."""
+    return build_dashboard(db, services.load_runtime_settings(db), days)
 
 
 # ---------------------------------------------------------------------- users
@@ -43,19 +119,31 @@ def _meeting_counts(db: Session, user_ids: list[uuid.UUID]) -> dict[uuid.UUID, i
     return dict(rows.all())
 
 
-def _out(user: User, meeting_count: int) -> AdminUserOut:
-    return AdminUserOut.model_validate(
-        {
-            "id": user.id,
-            "email": user.email,
-            "full_name": user.full_name,
-            "role": user.role,
-            "created_at": user.created_at,
-            "is_active": user.is_active,
-            "last_login_at": user.last_login_at,
-            "meeting_count": meeting_count,
-        }
-    )
+def _users_out(db: Session, users: list[User]) -> list[AdminUserOut]:
+    ids = [u.id for u in users]
+    counts, usage = _meeting_counts(db, ids), usage_by_user(db, ids)
+    return [
+        AdminUserOut.model_validate(
+            {
+                "id": u.id,
+                "email": u.email,
+                "full_name": u.full_name,
+                "role": u.role,
+                "created_at": u.created_at,
+                "is_active": u.is_active,
+                "disabled_reason": u.disabled_reason,
+                "disabled_at": u.disabled_at,
+                "last_login_at": u.last_login_at,
+                "last_active_at": u.last_active_at,
+                "meeting_count": counts.get(u.id, 0),
+                "uploads_this_month": usage.get(u.id, (0, 0.0))[0],
+                "audio_minutes_this_month": usage.get(u.id, (0, 0.0))[1],
+                "quota_uploads_per_month": u.quota_uploads_per_month,
+                "quota_audio_minutes_per_month": u.quota_audio_minutes_per_month,
+            }
+        )
+        for u in users
+    ]
 
 
 def ensure_not_last_admin(db: Session, user: User) -> None:
@@ -101,33 +189,178 @@ def list_users(
     users = list(
         db.scalars(select(User).where(*filters).order_by(User.created_at.desc()).limit(limit).offset(offset))
     )
-    counts = _meeting_counts(db, [u.id for u in users])
-    return AdminUserPage(
-        items=[_out(u, counts.get(u.id, 0)) for u in users], total=total, limit=limit, offset=offset
-    )
+    return AdminUserPage(items=_users_out(db, users), total=total, limit=limit, offset=offset)
 
 
 @router.get("/users/{user_id}", response_model=AdminUserOut)
 def get_user(user_id: uuid.UUID, admin: CurrentAdmin, db: DbSession):
-    user = _get_user(db, user_id)
-    return _out(user, _meeting_counts(db, [user.id]).get(user.id, 0))
+    return _users_out(db, [_get_user(db, user_id)])[0]
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserOut)
 def update_user(user_id: uuid.UUID, body: AdminUserUpdate, admin: CurrentAdmin, db: DbSession):
-    """Change a user's role, disable or re-enable the account, or fix the name."""
+    """Change a user's role, revoke or restore access (with a reason shown to the user at
+    login), set per-user monthly quotas, or fix the name. Accounts can't be deleted here."""
     user = _get_user(db, user_id)
     fields = body.model_fields_set
     if ("role" in fields and body.role == UserRole.USER) or ("is_active" in fields and body.is_active is False):
         ensure_not_last_admin(db, user)
 
-    if "role" in fields and body.role is not None:
+    details: dict[str, Any] = {}
+    if "role" in fields and body.role is not None and body.role != user.role:
+        details["role"] = [user.role, body.role]
         user.role = body.role
     if "full_name" in fields:
         user.full_name = body.full_name
-    if "is_active" in fields and body.is_active is not None:
+        details["full_name"] = True
+    for name in ("quota_uploads_per_month", "quota_audio_minutes_per_month"):
+        if name in fields:
+            details[name] = [getattr(user, name), getattr(body, name)]
+            setattr(user, name, getattr(body, name))
+    if "is_active" in fields and body.is_active is not None and body.is_active != user.is_active:
         user.is_active = body.is_active
-        if not body.is_active:
+        if body.is_active:
+            user.disabled_reason, user.disabled_at = None, None
+            details["access"] = "restored"
+        else:
+            user.disabled_reason, user.disabled_at = body.disabled_reason or None, utcnow()
             revoke_all_refresh_tokens(db, user.id)  # signed out everywhere, immediately
+            details["access"] = "revoked"
+            details["reason"] = user.disabled_reason
+    elif "disabled_reason" in fields and not user.is_active:
+        user.disabled_reason = body.disabled_reason or None
+        details["reason"] = user.disabled_reason
+
+    if details:
+        audit(db, admin, "user.update", "user", user.id, {"email": user.email, **details})
     db.commit()
-    return _out(user, _meeting_counts(db, [user.id]).get(user.id, 0))
+    return _users_out(db, [user])[0]
+
+
+# ------------------------------------------------------------------- meetings
+
+
+def _owner(meeting: Meeting) -> OwnerRef:
+    owner = meeting.owner
+    return OwnerRef(id=owner.id, email=owner.email, full_name=owner.full_name, is_active=owner.is_active)
+
+
+def _get_meeting(db: Session, meeting_id: uuid.UUID) -> Meeting:
+    meeting = db.get(Meeting, meeting_id, options=_MEETING_LOAD)
+    if meeting is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Meeting not found")
+    return meeting
+
+
+@router.get("/meetings", response_model=AdminMeetingPage)
+def list_all_meetings(
+    admin: CurrentAdmin,
+    db: DbSession,
+    settings: AppSettings,
+    user_id: uuid.UUID | None = None,
+    q: Annotated[str | None, Query(max_length=200, description="Search title and transcript")] = None,
+    status_filter: Annotated[MeetingStatus | None, Query(alias="status")] = None,
+    date_from: UTCDateTime | None = None,
+    date_to: UTCDateTime | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    """Every user's meetings, newest first (by meeting date)."""
+    filters = []
+    if user_id is not None:
+        filters.append(Meeting.owner_id == user_id)
+    if q and q.strip():
+        term = q.strip()
+        filters.append(or_(Meeting.title.icontains(term, autoescape=True), Meeting.transcript.icontains(term, autoescape=True)))
+    if status_filter is not None:
+        filters.append(Meeting.status == status_filter)
+    if date_from is not None:
+        filters.append(Meeting.meeting_date >= date_from)
+    if date_to is not None:
+        filters.append(Meeting.meeting_date <= date_to)
+
+    total = db.scalar(select(func.count()).select_from(Meeting).where(*filters))
+    meetings = list(
+        db.scalars(
+            select(Meeting)
+            .where(*filters)
+            .options(*_MEETING_LOAD)
+            .order_by(Meeting.meeting_date.desc(), Meeting.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    )
+    expire_stale(db, meetings, settings)
+    items = [
+        AdminMeetingListItem(**to_list_item(m).model_dump(), owner=_owner(m)) for m in meetings
+    ]
+    return AdminMeetingPage(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/meetings/{meeting_id}", response_model=AdminMeetingDetail)
+def get_any_meeting(meeting_id: uuid.UUID, admin: CurrentAdmin, db: DbSession, settings: AppSettings):
+    """The full meeting, including the transcript. Logged in the audit log."""
+    meeting = _get_meeting(db, meeting_id)
+    expire_stale(db, [meeting], settings)
+    audit(db, admin, "meeting.view", "meeting", meeting.id, {"owner": meeting.owner.email, "title": meeting.title})
+    db.commit()
+    return AdminMeetingDetail(**to_detail(meeting).model_dump(), owner=_owner(meeting))
+
+
+@router.get("/meetings/{meeting_id}/export", response_class=Response, responses=EXPORT_RESPONSES)
+def export_any_meeting(
+    meeting_id: uuid.UUID,
+    admin: CurrentAdmin,
+    db: DbSession,
+    format: Literal["pdf", "docx"] = "pdf",
+    include_transcript: bool = False,
+):
+    meeting = _get_meeting(db, meeting_id)
+    audit(
+        db, admin, "meeting.export", "meeting", meeting.id,
+        {"owner": meeting.owner.email, "format": format, "include_transcript": include_transcript},
+    )
+    db.commit()
+    return export_response(meeting, format, include_transcript)
+
+
+@router.delete("/meetings/{meeting_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_any_meeting(meeting_id: uuid.UUID, admin: CurrentAdmin, db: DbSession):
+    meeting = _get_meeting(db, meeting_id)
+    audit(db, admin, "meeting.delete", "meeting", meeting.id, {"owner": meeting.owner.email, "title": meeting.title})
+    db.delete(meeting)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ------------------------------------------------------------------ audit log
+
+
+@router.get("/audit-log", response_model=AuditLogPage)
+def list_audit_log(
+    admin: CurrentAdmin,
+    db: DbSession,
+    action: Annotated[str | None, Query(max_length=50, description='e.g. "meeting.view"')] = None,
+    admin_id: uuid.UUID | None = None,
+    target_id: Annotated[str | None, Query(max_length=64)] = None,
+    since: UTCDateTime | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+):
+    """Who did what, newest first."""
+    filters = []
+    if action:
+        filters.append(AdminAuditLog.action == action)
+    if admin_id is not None:
+        filters.append(AdminAuditLog.admin_id == admin_id)
+    if target_id:
+        filters.append(AdminAuditLog.target_id == target_id)
+    if since is not None:
+        filters.append(AdminAuditLog.created_at >= since)
+    total = db.scalar(select(func.count()).select_from(AdminAuditLog).where(*filters))
+    entries = db.scalars(
+        select(AdminAuditLog).where(*filters).order_by(AdminAuditLog.created_at.desc()).limit(limit).offset(offset)
+    )
+    return AuditLogPage(
+        items=[AuditLogEntry.model_validate(e) for e in entries], total=total, limit=limit, offset=offset
+    )

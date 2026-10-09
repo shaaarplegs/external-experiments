@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import openai
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.config import Settings
@@ -17,11 +18,15 @@ from app.models import (
     ActionItemSource,
     Meeting,
     MeetingStatus,
+    ProcessingRun,
+    RunKind,
+    RunStatus,
     utcnow,
 )
+from app.runtime_settings import RuntimeSettings
 from app.schemas import LLMMeetingSummary, MeetingSummaryContent
-from app.services.audio import AudioError, iter_chunks
-from app.services.summarizer import MeetingContext, SummarizerError
+from app.services.audio import AudioError, iter_chunks, normalize
+from app.services.summarizer import MeetingContext, Summarizer, SummarizerError
 from app.services.transcription import Transcriber, TranscriptionError
 
 logger = logging.getLogger(__name__)
@@ -50,6 +55,12 @@ def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> No
     for meeting in meetings:
         started = meeting.processing_started_at
         if is_processing(meeting) and started and started < cutoff:
+            stage = "summary" if meeting.status == MeetingStatus.SUMMARIZING else "transcription"
+            db.execute(
+                update(ProcessingRun)
+                .where(ProcessingRun.meeting_id == meeting.id, ProcessingRun.status == RunStatus.RUNNING)
+                .values(status=RunStatus.FAILED, failed_stage=stage, finished_at=utcnow())
+            )
             meeting.status = MeetingStatus.FAILED
             meeting.error_message = INTERRUPTED_MESSAGE
             changed = True
@@ -59,15 +70,17 @@ def expire_stale(db: Session, meetings: list[Meeting], settings: Settings) -> No
 
 def transcribe_audio(
     transcriber: Transcriber, source: Path, work_dir: Path, language: str | None, chunk_seconds: int
-) -> str:
+) -> tuple[str, float]:
+    """Returns the transcript and the recording's length in seconds."""
+    audio = normalize(source, work_dir / "chunks")
     texts = []
-    for index, chunk in enumerate(iter_chunks(source, work_dir / "chunks", chunk_seconds), start=1):
+    for index, chunk in enumerate(iter_chunks(audio, chunk_seconds), start=1):
         logger.info("Transcribing chunk %s", index)
         text = transcriber.transcribe_file(chunk, language)
         chunk.unlink()
         if text:
             texts.append(text)
-    return "\n".join(texts)
+    return "\n".join(texts), audio.duration_seconds
 
 
 def build_context(meeting: Meeting) -> MeetingContext:
@@ -121,21 +134,50 @@ def describe_failure(exc: Exception, stage: str) -> str:
     return f"Unexpected error during {stage}. Please retry."
 
 
-def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | None) -> None:
+def finish_run(
+    services: Services,
+    run_id: uuid.UUID,
+    status: RunStatus,
+    failed_stage: str | None,
+    runtime: RuntimeSettings | None,
+    audio_seconds: float | None,
+    summarizer: Summarizer | None,
+) -> None:
+    """Record the outcome in the usage log (in its own session, whatever happened above)."""
+    with services.session_factory() as db:
+        run = db.get(ProcessingRun, run_id)
+        if run is None:
+            return
+        run.status = status
+        run.failed_stage = failed_stage
+        run.finished_at = utcnow()
+        if audio_seconds is not None:
+            run.audio_seconds = audio_seconds
+        if runtime is not None:
+            run.llm_model = runtime.llm_model
+            if run.kind != RunKind.RESUMMARIZE:
+                run.transcription_model = runtime.transcription_model
+        if summarizer is not None:
+            run.llm_prompt_tokens, run.llm_completion_tokens = summarizer.tokens_used
+        db.commit()
+
+
+def run_pipeline(services: Services, meeting_id: uuid.UUID, run_id: uuid.UUID, audio_path: Path | None) -> None:
     """Background job. With audio: transcribe then summarize. Without: re-summarize."""
     stage = "transcription" if audio_path else "summary"
+    status, runtime, audio_seconds, summarizer = RunStatus.FAILED, None, None, None
     db = services.session_factory()
     try:
         meeting = db.get(Meeting, meeting_id)
         if meeting is None:
-            return
+            return  # deleted before the job started
         # The admin settings as they are now: keys, models and prompt changes apply to the next job.
         runtime = services.load_runtime_settings(db)
 
         if audio_path is not None:
             meeting.status = MeetingStatus.TRANSCRIBING
             db.commit()
-            transcript = transcribe_audio(
+            transcript, audio_seconds = transcribe_audio(
                 services.make_transcriber(runtime),
                 audio_path,
                 audio_path.parent,
@@ -145,6 +187,8 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | N
             if not transcript.strip():
                 raise NoSpeechError("No speech was detected in the recording.")
             meeting.transcript = transcript
+            if meeting.duration_seconds is None:
+                meeting.duration_seconds = round(audio_seconds)
             db.commit()
 
         if not (meeting.transcript or "").strip():
@@ -153,12 +197,13 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | N
         stage = "summary"
         meeting.status = MeetingStatus.SUMMARIZING
         db.commit()
-        summary = services.make_summarizer(runtime).summarize(meeting.transcript, build_context(meeting))
-        apply_summary(meeting, summary)
+        summarizer = services.make_summarizer(runtime)
+        apply_summary(meeting, summarizer.summarize(meeting.transcript, build_context(meeting)))
         meeting.status = MeetingStatus.COMPLETED
         meeting.error_message = None
         meeting.processed_at = utcnow()
         db.commit()
+        status = RunStatus.COMPLETED
         logger.info("Meeting %s processed", meeting_id)
     except Exception as exc:
         logger.exception("Meeting %s failed during %s", meeting_id, stage)
@@ -172,3 +217,5 @@ def run_pipeline(services: Services, meeting_id: uuid.UUID, audio_path: Path | N
         db.close()
         if audio_path is not None:
             shutil.rmtree(audio_path.parent, ignore_errors=True)
+        failed_stage = None if status == RunStatus.COMPLETED else stage
+        finish_run(services, run_id, status, failed_stage, runtime, audio_seconds, summarizer)

@@ -31,6 +31,7 @@ from app.models import (
     Meeting,
     MeetingAttendee,
     MeetingStatus,
+    RunKind,
     User,
 )
 from app.routers.categories import get_owned_category
@@ -49,6 +50,7 @@ from app.schemas import (
 )
 from app.services.audio import AudioError, probe
 from app.services.pipeline import expire_stale, is_processing, mark_queued, run_pipeline
+from app.services.usage import QuotaExceeded, check_quota, start_run
 
 router = APIRouter(prefix="/meetings", tags=["meetings"])
 
@@ -156,9 +158,33 @@ def save_upload(upload: UploadFile, work_dir: Path, runtime: RuntimeSettings) ->
         raise
 
 
+def enforce_quota(db: Session, user: User, runtime: RuntimeSettings, audio_seconds: float | None) -> None:
+    """Locks the user's row until the caller commits, so concurrent uploads are counted in turn."""
+    db.execute(select(User.id).where(User.id == user.id).with_for_update())
+    try:
+        check_quota(db, user, runtime, audio_seconds)
+    except QuotaExceeded as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+
+
+def precheck_quota(db: Session, user: User, runtime: RuntimeSettings) -> None:
+    """Cheap check before receiving the file: is any upload left this month?"""
+    try:
+        check_quota(db, user, runtime, None)
+    except QuotaExceeded as exc:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, str(exc)) from exc
+
+
 def ensure_idle(meeting: Meeting) -> None:
     if is_processing(meeting):
         raise HTTPException(status.HTTP_409_CONFLICT, "This meeting is still being processed")
+
+
+def lock_idle_meeting(db: Session, meeting: Meeting) -> None:
+    """Lock the meeting row and re-check it, so two retries sent at once start one job."""
+    db.execute(select(Meeting.id).where(Meeting.id == meeting.id).with_for_update())
+    db.refresh(meeting)
+    ensure_idle(meeting)
 
 
 # ------------------------------------------------------------------ meetings
@@ -185,9 +211,11 @@ def create_meeting(
     language_hint = resolve_language(language, runtime)
     if category_id is not None:
         get_owned_category(db, user, category_id)
+    precheck_quota(db, user, runtime)
 
     audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
+        enforce_quota(db, user, runtime, audio_seconds)
         meeting = Meeting(
             owner_id=user.id,
             title=(title or "").strip() or None,
@@ -203,11 +231,16 @@ def create_meeting(
         set_attendees(meeting, attendee_list)
         mark_queued(meeting)
         db.add(meeting)
+        db.flush()
+        run = start_run(
+            db, user_id=user.id, meeting_id=meeting.id, kind=RunKind.UPLOAD, audio_seconds=audio_seconds
+        )
         db.commit()
     except BaseException:
+        db.rollback()
         shutil.rmtree(audio_path.parent, ignore_errors=True)
         raise
-    background.add_task(run_pipeline, services, meeting.id, audio_path)
+    background.add_task(run_pipeline, services, meeting.id, run.id, audio_path)
     return to_detail(get_owned_meeting(db, user, meeting.id))
 
 
@@ -314,19 +347,25 @@ def replace_audio(
     expire_stale(db, [meeting], services.settings)
     ensure_idle(meeting)
     runtime = services.load_runtime_settings(db)
-    if language is not None:
-        meeting.language = resolve_language(language, runtime)
+    language_hint = resolve_language(language, runtime) if language is not None else meeting.language
+    precheck_quota(db, user, runtime)
     audio_path, audio_seconds = save_upload(audio, services.settings.work_dir, runtime)
     try:
-        if audio_seconds:
-            meeting.duration_seconds = round(audio_seconds)
+        lock_idle_meeting(db, meeting)
+        enforce_quota(db, user, runtime, audio_seconds)
+        meeting.language = language_hint
+        meeting.duration_seconds = round(audio_seconds) if audio_seconds else None
         meeting.source_filename = (audio.filename or "")[:255] or None
         mark_queued(meeting)
+        run = start_run(
+            db, user_id=user.id, meeting_id=meeting.id, kind=RunKind.REUPLOAD, audio_seconds=audio_seconds
+        )
         db.commit()
     except BaseException:
+        db.rollback()
         shutil.rmtree(audio_path.parent, ignore_errors=True)
         raise
-    background.add_task(run_pipeline, services, meeting.id, audio_path)
+    background.add_task(run_pipeline, services, meeting.id, run.id, audio_path)
     return to_detail(meeting)
 
 
@@ -339,9 +378,11 @@ def resummarize(meeting_id: uuid.UUID, background: BackgroundTasks, user: Curren
     ensure_idle(meeting)
     if not (meeting.transcript or "").strip():
         raise HTTPException(status.HTTP_409_CONFLICT, "This meeting has no transcript yet")
+    lock_idle_meeting(db, meeting)
     mark_queued(meeting)
+    run = start_run(db, user_id=user.id, meeting_id=meeting.id, kind=RunKind.RESUMMARIZE)
     db.commit()
-    background.add_task(run_pipeline, services, meeting.id, None)
+    background.add_task(run_pipeline, services, meeting.id, run.id, None)
     return to_detail(meeting)
 
 
@@ -415,11 +456,20 @@ def content_disposition(filename: str) -> str:
     return f"attachment; filename=\"{ascii_name}.{ext}\"; filename*=UTF-8''{quote(filename)}"
 
 
-@router.get(
-    "/{meeting_id}/export",
-    response_class=Response,
-    responses={200: {"content": {mime: {} for mime in EXPORT_TYPES.values()}}},
-)
+def export_response(meeting: Meeting, format: Literal["pdf", "docx"], include_transcript: bool) -> Response:
+    view = build_view(meeting, include_transcript=include_transcript)
+    content = render_pdf(view) if format == "pdf" else render_docx(view)
+    return Response(
+        content=content,
+        media_type=EXPORT_TYPES[format],
+        headers={"Content-Disposition": content_disposition(export_filename(view, format))},
+    )
+
+
+EXPORT_RESPONSES = {200: {"content": {mime: {} for mime in EXPORT_TYPES.values()}}}
+
+
+@router.get("/{meeting_id}/export", response_class=Response, responses=EXPORT_RESPONSES)
 def export_meeting(
     meeting_id: uuid.UUID,
     user: CurrentUser,
@@ -427,10 +477,4 @@ def export_meeting(
     format: Literal["pdf", "docx"] = "pdf",
     include_transcript: bool = False,
 ):
-    view = build_view(get_owned_meeting(db, user, meeting_id), include_transcript=include_transcript)
-    content = render_pdf(view) if format == "pdf" else render_docx(view)
-    return Response(
-        content=content,
-        media_type=EXPORT_TYPES[format],
-        headers={"Content-Disposition": content_disposition(export_filename(view, format))},
-    )
+    return export_response(get_owned_meeting(db, user, meeting_id), format, include_transcript)
