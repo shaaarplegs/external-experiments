@@ -106,27 +106,6 @@ def test_summarizer_parses_json_mode_output():
     assert "<transcript>\nwe reviewed the budget\n</transcript>" in request["messages"][1]["content"]
 
 
-def test_summarizer_falls_back_when_json_mode_is_rejected():
-    import httpx
-    from openai import BadRequestError
-
-    summarizer, chat = make_summarizer([("```json\n" + VALID + "\n```", "stop")])
-    create = chat.create
-
-    def reject_json_mode(**kwargs):
-        if "response_format" in kwargs:
-            request = httpx.Request("POST", "https://example.test/chat/completions")
-            raise BadRequestError("response_format not supported", response=httpx.Response(400, request=request), body=None)
-        return create(**kwargs)
-
-    chat.create = reject_json_mode
-    context = MeetingContext(title="Budget", meeting_date=date(2026, 10, 9), attendees=[])
-    result = summarizer.summarize("we reviewed the budget", context)
-
-    assert result.decisions == ["Cut travel by 10%"]  # fenced JSON is accepted
-    assert "response_format" not in chat.requests[0]
-
-
 def test_summarizer_retries_once_on_invalid_json():
     summarizer, chat = make_summarizer([("", "stop"), (VALID, "stop")])
     assert summarizer.summarize("text", MeetingContext()).title == "Budget review"

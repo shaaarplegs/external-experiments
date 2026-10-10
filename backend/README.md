@@ -179,18 +179,8 @@ cd external-experiments
 bash backend/deploy/cloud-shell-deploy.sh   # optional: REGION=... ADMIN_EMAIL=... in front
 ```
 
-Then open `<url>/panel/`, sign in as the printed admin, and set the keys under Settings (or in the
-Android app's Settings, as the admin).
-
-**Free setup (no paid APIs):**
-- **Speech-to-text:** Groq's free tier (the default). Get a key at https://console.groq.com/keys.
-  Its limits are about 2 hours of audio per hour and 8 hours per day.
-- **Summaries:** Google Gemini's free tier. Under Summaries, click **Google Gemini (free tier)**
-  (in the app, pick **Gemini (free)**), then paste a key from https://aistudio.google.com/apikey.
-  - Google may use free-tier prompts to improve its products, so don't use it for confidential meetings.
-  - The free tier has daily request limits, and each meeting uses one or a few requests.
-
-**DeepSeek (paid)** stays one click away; it is the built-in default. Run the script again to redeploy after code changes; it keeps the existing
+Then open `<url>/panel/`, sign in as the printed admin, and paste the Groq and DeepSeek keys
+under Settings. Run the script again to redeploy after code changes; it keeps the existing
 database and secrets.
 
 The manual steps below use Neon instead:
