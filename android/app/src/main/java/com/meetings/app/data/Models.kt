@@ -110,7 +110,22 @@ data class SecretStatus(val configured: Boolean, val hint: String? = null)
 
 /** The parts of GET /admin/settings the app shows. */
 @Serializable
-data class AdminSettings(val transcription_api_key: SecretStatus, val llm_api_key: SecretStatus)
+data class AdminSettings(
+    val transcription_api_key: SecretStatus,
+    val llm_api_key: SecretStatus,
+    val llm_base_url: String = "",
+    val llm_model: String = "",
+)
+
+/** Summary providers an admin can pick with one tap; the backend accepts any OpenAI-compatible API. */
+enum class LlmPreset(val baseUrl: String, val model: String, val maxTokens: Int) {
+    GEMINI("https://generativelanguage.googleapis.com/v1beta/openai/", "gemini-flash-latest", 32000),
+    DEEPSEEK("https://api.deepseek.com", "deepseek-chat", 8000);
+
+    companion object {
+        fun of(settings: AdminSettings): LlmPreset? = entries.firstOrNull { settings.llm_base_url.trimEnd('/') == it.baseUrl.trimEnd('/') }
+    }
+}
 
 /** A download from GET /meetings/{id}/export. */
 class ExportedFile(val name: String, val mimeType: String, val bytes: ByteArray)

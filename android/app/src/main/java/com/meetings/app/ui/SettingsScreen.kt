@@ -20,6 +20,9 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -40,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.meetings.app.MeetingsApp
 import com.meetings.app.R
 import com.meetings.app.data.AdminSettings
+import com.meetings.app.data.LlmPreset
 import com.meetings.app.data.SecretStatus
 import com.meetings.app.data.Usage
 import kotlinx.coroutines.launch
@@ -154,24 +158,27 @@ private fun UsageRow(label: String, used: Double, limit: Int?, format: String) {
     }
 }
 
-/** Admins set the provider API keys here (also available in the web admin panel at /panel). */
+/** Admins pick the summary provider and set the API keys here (also in the web admin panel at /panel). */
 @Composable
 private fun AdminKeys() {
     val context = LocalContext.current
     val api = api()
     val scope = rememberCoroutineScope()
     var settings by remember { mutableStateOf<AdminSettings?>(null) }
+    var preset by remember { mutableStateOf<LlmPreset?>(null) }
     var groq by remember { mutableStateOf("") }
-    var deepseek by remember { mutableStateOf("") }
+    var llmKey by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var saved by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         try {
-            settings = api.adminSettings()
+            settings = api.adminSettings().also { preset = LlmPreset.of(it) }
         } catch (e: Exception) {
             error = context.errorMessage(e)
         }
     }
+    val current = settings?.let { LlmPreset.of(it) }
+    val switching = preset != null && preset != current
 
     @Composable
     fun status(s: SecretStatus?): String = when {
@@ -185,17 +192,33 @@ private fun AdminKeys() {
     OutlinedTextField(groq, { groq = it; saved = false }, label = { Text(stringResource(R.string.transcription_key)) },
         supportingText = { Text(status(settings?.transcription_api_key)) },
         singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-    OutlinedTextField(deepseek, { deepseek = it; saved = false }, label = { Text(stringResource(R.string.llm_key)) },
-        supportingText = { Text(status(settings?.llm_api_key)) },
+
+    Text(stringResource(R.string.summary_provider), style = MaterialTheme.typography.labelLarge)
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        LlmPreset.entries.forEachIndexed { i, p ->
+            SegmentedButton(
+                selected = preset == p, onClick = { preset = p; saved = false },
+                shape = SegmentedButtonDefaults.itemShape(i, LlmPreset.entries.size),
+            ) { Text(stringResource(if (p == LlmPreset.GEMINI) R.string.provider_gemini else R.string.provider_deepseek)) }
+        }
+    }
+    if (settings != null && current == null && preset == null) {
+        Text(stringResource(R.string.provider_custom, settings!!.llm_model), style = MaterialTheme.typography.bodySmall)
+    }
+    OutlinedTextField(llmKey, { llmKey = it; saved = false },
+        label = { Text(stringResource(if (preset == LlmPreset.DEEPSEEK) R.string.llm_key_deepseek else R.string.llm_key_gemini)) },
+        supportingText = {
+            Text(if (switching) stringResource(R.string.provider_needs_key) else status(settings?.llm_api_key))
+        },
         singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
     ErrorText(error)
     if (saved) Text(stringResource(R.string.keys_saved), color = MaterialTheme.colorScheme.primary)
-    Button(enabled = groq.isNotBlank() || deepseek.isNotBlank(), onClick = {
+    Button(enabled = groq.isNotBlank() || llmKey.isNotBlank() || switching, onClick = {
         scope.launch {
             error = null
             try {
-                settings = api.setApiKeys(groq, deepseek)
-                groq = ""; deepseek = ""; saved = true
+                settings = api.saveAdminSettings(groq, llmKey, preset.takeIf { switching || llmKey.isNotBlank() })
+                groq = ""; llmKey = ""; saved = true
             } catch (e: Exception) {
                 error = context.errorMessage(e)
             }

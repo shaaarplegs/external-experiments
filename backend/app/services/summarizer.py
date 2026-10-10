@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Protocol
 
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 from pydantic import ValidationError
 
 from app.runtime_settings import RuntimeSettings
@@ -87,6 +87,15 @@ def split_text(text: str, max_chars: int) -> list[str]:
     return pieces
 
 
+def strip_code_fence(text: str) -> str:
+    """Models without JSON mode often wrap the object in ```json ... ```."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    return text
+
+
 class OpenAICompatibleSummarizer:
     """Chat-completions summarizer; DeepSeek by default, any OpenAI-compatible API works."""
 
@@ -95,6 +104,7 @@ class OpenAICompatibleSummarizer:
         self._client: OpenAI | None = None
         self._prompt_tokens = 0
         self._completion_tokens = 0
+        self._json_mode_supported = True
 
     def _get_client(self) -> OpenAI:
         if not self._runtime.llm_api_key:
@@ -121,9 +131,18 @@ class OpenAICompatibleSummarizer:
             "temperature": self._runtime.llm_temperature,
             "max_tokens": self._runtime.llm_max_tokens,
         }
-        if json_mode:
+        if json_mode and self._json_mode_supported:
             kwargs["response_format"] = {"type": "json_object"}
-        response = self._get_client().chat.completions.create(**kwargs)
+        try:
+            response = self._get_client().chat.completions.create(**kwargs)
+        except BadRequestError:
+            if "response_format" not in kwargs:
+                raise
+            # Some OpenAI-compatible APIs reject JSON mode; the prompt already asks for JSON.
+            logger.warning("The LLM rejected JSON mode; retrying without it")
+            self._json_mode_supported = False
+            del kwargs["response_format"]
+            response = self._get_client().chat.completions.create(**kwargs)
         usage = getattr(response, "usage", None)
         if usage is not None:
             self._prompt_tokens += usage.prompt_tokens or 0
@@ -153,7 +172,7 @@ class OpenAICompatibleSummarizer:
         for attempt in range(2):  # JSON mode occasionally returns empty or partial output
             content = self._chat(self._runtime.summary_prompt, user_message, json_mode=True)
             try:
-                return LLMMeetingSummary.model_validate(json.loads(content))
+                return LLMMeetingSummary.model_validate(json.loads(strip_code_fence(content)))
             except (json.JSONDecodeError, ValidationError) as exc:
                 logger.warning("Summary attempt %s returned invalid JSON: %s", attempt + 1, exc)
                 last_error = exc

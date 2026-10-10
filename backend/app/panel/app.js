@@ -515,6 +515,21 @@ const SETTINGS_GROUPS = [
   ]],
 ];
 
+// One click fills the provider fields; paste that provider's key and save.
+const LLM_PRESETS = [
+  ["Google Gemini (free tier)", { llm_base_url: "https://generativelanguage.googleapis.com/v1beta/openai/", llm_model: "gemini-flash-latest", llm_max_tokens: 32000 }],
+  ["DeepSeek (paid)", { llm_base_url: "https://api.deepseek.com", llm_model: "deepseek-chat", llm_max_tokens: 8000 }],
+];
+
+function presetRow(presets) {
+  return h("div", { class: "row", style: "margin-bottom:12px" }, h("span", { class: "hint" }, "Provider:"),
+    presets.map(([label, values]) => h("button", { type: "button", class: "secondary", onclick: (e) => {
+      const form = e.target.closest("form");
+      for (const [name, value] of Object.entries(values)) form.elements[name].value = value;
+      toast(`${label}: paste its API key, then Save changes`);
+    } }, label)));
+}
+
 async function viewSettings() {
   const current = await api("/admin/settings");
   const input = (name, label, kind, step) => {
@@ -548,6 +563,7 @@ async function viewSettings() {
     catch (err) { toast(err.message); }
   } },
     SETTINGS_GROUPS.map(([title, items]) => h("div", { class: "card" }, h("h2", {}, title),
+      title === "Summaries (LLM)" ? presetRow(LLM_PRESETS) : null,
       h("div", { class: "fieldset" }, items.map(([name, label, kind, step]) => input(name, label, kind, step))))),
     h("div", { class: "card" }, h("h2", {}, "Summary format (system prompt)"),
       h("p", { class: "hint" }, "Sent before every transcript. It must ask for a json object with the keys the app expects. Existing meetings pick up a change when their summary is regenerated."),

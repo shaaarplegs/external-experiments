@@ -171,11 +171,16 @@ class ApiClient(private val session: SessionStore) {
 
     suspend fun adminSettings(): AdminSettings = call(get("admin/settings"))
 
-    /** Blank values are left unchanged. */
-    suspend fun setApiKeys(transcriptionKey: String, llmKey: String): AdminSettings {
+    /** Blank keys are left unchanged; a non-null [preset] switches the summary provider. */
+    suspend fun saveAdminSettings(transcriptionKey: String, llmKey: String, preset: LlmPreset?): AdminSettings {
         val body = buildJsonObject {
             if (transcriptionKey.isNotBlank()) put("transcription_api_key", transcriptionKey.trim())
             if (llmKey.isNotBlank()) put("llm_api_key", llmKey.trim())
+            if (preset != null) {
+                put("llm_base_url", preset.baseUrl)
+                put("llm_model", preset.model)
+                put("llm_max_tokens", preset.maxTokens)
+            }
         }
         return call(patch("admin/settings", body))
     }
